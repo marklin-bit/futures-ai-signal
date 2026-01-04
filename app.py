@@ -183,11 +183,12 @@ class StrategyEngine:
                     prob = self.models['Long_Exit_Model'].predict_proba(exit_feats)[0][1]
                     if prob > self.params['exit_threshold']:
                         strat_pos = 0
-                        strat_action = "❌ 多出" # 紅色叉叉
+                        strat_action = "❌ 多出" 
                         strat_detail = f"出場率 {prob:.0%} {trend_str}"
                     else:
                         strat_action = "⏳ 續抱"
-                        strat_detail = f"帳面 {pnl:.0f} {trend_str}"
+                        hold_conf = 1.0 - prob
+                        strat_detail = f"帳面{pnl:.0f}(續:{hold_conf:.0%}/多:{prob_long:.0%}/空:{prob_short:.0%})"
 
             elif strat_pos == -1:
                 pnl = strat_entry_price - current_close
@@ -203,11 +204,12 @@ class StrategyEngine:
                     prob = self.models['Short_Exit_Model'].predict_proba(exit_feats)[0][1]
                     if prob > self.params['exit_threshold']:
                         strat_pos = 0
-                        strat_action = "❎ 空出" # 綠色叉叉
+                        strat_action = "❎ 空出" 
                         strat_detail = f"出場率 {prob:.0%} {trend_str}"
                     else:
                         strat_action = "⏳ 續抱"
-                        strat_detail = f"帳面 {pnl:.0f} {trend_str}"
+                        hold_conf = 1.0 - prob
+                        strat_detail = f"帳面{pnl:.0f}(續:{hold_conf:.0%}/多:{prob_long:.0%}/空:{prob_short:.0%})"
 
             # --- 2. 計算使用者持單建議 (User Advice) ---
             user_advice = "-"
@@ -249,7 +251,6 @@ class StrategyEngine:
                         u_prob = self.models['Long_Exit_Model'].predict_proba(u_exit_feats)[0][1]
                         hold_conf = 1.0 - u_prob
                         
-                        # 格式: 帳面XX(續:X%/多:X%/空:X%)
                         status_str = f"帳面{u_pnl:.0f}(續:{hold_conf:.0%}/多:{prob_long:.0%}/空:{prob_short:.0%})"
                         
                         if u_prob > self.params['exit_threshold']:
@@ -467,12 +468,9 @@ with right_col:
             # --- A. 歷史訊號列表 (置頂) ---
             st.subheader("📜 歷史訊號回放")
             
-            c_sort, _ = st.columns([1, 2])
-            sort_order = c_sort.radio("排序方式", ["時間：新 → 舊 (倒序)", "時間：舊 → 新 (正序)"], horizontal=True, label_visibility="collapsed")
-            
+            # [Removed] 移除 radio 排序選項，改為預設倒序
             df_show = df_history.copy()
-            if "新 → 舊" in sort_order:
-                df_show = df_show.iloc[::-1] # 倒序
+            df_show = df_show.iloc[::-1] # 預設倒序
             
             st.dataframe(
                 df_show,
@@ -509,9 +507,9 @@ with right_col:
             if not sells.empty:
                 fig.add_trace(go.Scatter(x=sells['Time'], y=sells['Close'], mode='markers', name='Sell', marker=dict(symbol='triangle-down', size=15, color='green')))
             if not exits_long.empty:
-                fig.add_trace(go.Scatter(x=exits_long['Time'], y=exits_long['Close'], mode='markers', name='Exit Long', marker=dict(symbol='x', size=12, color='red')))
+                fig.add_trace(go.Scatter(x=exits_long['Time'], y=exits_long['Close'], mode='markers', name='Exit Long', marker=dict(symbol='x', size=12, color='red'))) # 改紅X
             if not exits_short.empty:
-                fig.add_trace(go.Scatter(x=exits_short['Time'], y=exits_short['Close'], mode='markers', name='Exit Short', marker=dict(symbol='x', size=12, color='green')))
+                fig.add_trace(go.Scatter(x=exits_short['Time'], y=exits_short['Close'], mode='markers', name='Exit Short', marker=dict(symbol='x', size=12, color='green'))) # 改綠X
             
             # [Added] 標記真實部位進場點
             real_entry_idx, _ = engine.find_entry_info(user_entry_time)
@@ -519,7 +517,6 @@ with right_col:
             if real_entry_idx != -1 and real_entry_idx in df_chart.index:
                 entry_row = df_clean.loc[real_entry_idx]
                 
-                # 設定標記樣式 (紅漲綠跌)
                 marker_symbol = 'star'
                 marker_color = 'red' if user_pos_type == "多單 (Long)" else 'green'
                 marker_name = 'My Entry'
