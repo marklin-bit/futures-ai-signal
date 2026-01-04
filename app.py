@@ -124,6 +124,9 @@ class StrategyEngine:
             # 預先計算進場機率 (每一根都算，為了加碼判斷)
             prob_long = self.models['Long_Entry_Model'].predict_proba(current_features)[0][1]
             prob_short = self.models['Short_Entry_Model'].predict_proba(current_features)[0][1]
+            
+            # 統一的趨勢字串
+            trend_str = f"(多:{prob_long:.0%}/空:{prob_short:.0%})"
 
             # --- 1. 計算策略模擬 (Strategy Simulation) ---
             strat_action = "觀望"
@@ -135,21 +138,22 @@ class StrategyEngine:
                     strat_entry_price = current_close
                     strat_entry_index = i
                     strat_action = "🔥 買進"
-                    strat_detail = f"多 {prob_long:.0%}"
+                    strat_detail = f"多 {prob_long:.0%} {trend_str}"
                 elif prob_short > self.params['entry_threshold'] and prob_short > prob_long:
                     strat_pos = -1
                     strat_entry_price = current_close
                     strat_entry_index = i
                     strat_action = "⚡ 放空"
-                    strat_detail = f"空 {prob_short:.0%}"
+                    strat_detail = f"空 {prob_short:.0%} {trend_str}"
                 else:
-                    strat_detail = f"多:{prob_long:.0%} / 空:{prob_short:.0%}"
+                    strat_detail = f"{trend_str}"
 
             elif strat_pos == 1:
                 pnl = current_close - strat_entry_price
                 if pnl <= -self.params['hard_stop']:
                     strat_pos = 0
                     strat_action = "🛑 停損"
+                    strat_detail = f"損 {pnl:.0f} {trend_str}"
                 else:
                     exit_feats = current_features.copy()
                     exit_feats['Floating_PnL'] = pnl
@@ -159,17 +163,17 @@ class StrategyEngine:
                     if prob > self.params['exit_threshold']:
                         strat_pos = 0
                         strat_action = "🟢 出場"
-                        # 修正: 顯示出場率並保留多空信心
-                        strat_detail = f"出場 {prob:.0%} (多:{prob_long:.0%}/空:{prob_short:.0%})"
+                        strat_detail = f"出場率 {prob:.0%} {trend_str}"
                     else:
                         strat_action = "續抱"
-                        strat_detail = f"帳 {pnl:.0f}"
+                        strat_detail = f"帳面 {pnl:.0f} {trend_str}"
 
             elif strat_pos == -1:
                 pnl = strat_entry_price - current_close
                 if pnl <= -self.params['hard_stop']:
                     strat_pos = 0
                     strat_action = "🛑 停損"
+                    strat_detail = f"損 {pnl:.0f} {trend_str}"
                 else:
                     exit_feats = current_features.copy()
                     exit_feats['Floating_PnL'] = pnl
@@ -179,11 +183,10 @@ class StrategyEngine:
                     if prob > self.params['exit_threshold']:
                         strat_pos = 0
                         strat_action = "🔴 出場"
-                        # 修正: 顯示出場率並保留多空信心
-                        strat_detail = f"出場 {prob:.0%} (多:{prob_long:.0%}/空:{prob_short:.0%})"
+                        strat_detail = f"出場率 {prob:.0%} {trend_str}"
                     else:
                         strat_action = "續抱"
-                        strat_detail = f"帳 {pnl:.0f}"
+                        strat_detail = f"帳面 {pnl:.0f} {trend_str}"
 
             # --- 2. 計算使用者持單建議 (含加碼偵測) ---
             user_advice = "-"
@@ -208,15 +211,15 @@ class StrategyEngine:
                     
                     if u_prob > self.params['exit_threshold']:
                         user_advice = "🚀 建議出場"
-                        user_note = f"機率 {u_prob:.0%}"
+                        user_note = f"機率 {u_prob:.0%} {trend_str}"
                     else:
                         # 續抱狀態，檢查是否可加碼
                         if prob_long > self.params['entry_threshold'] and prob_long > prob_short:
                             user_advice = "⚓ 續抱 (🔥可加碼)"
-                            user_note = f"信心 {prob_long:.0%}"
+                            user_note = f"加碼信 {prob_long:.0%} {trend_str}"
                         else:
                             user_advice = "⚓ 建議續抱"
-                            user_note = f"帳 {u_pnl:.0f}"
+                            user_note = f"帳面 {u_pnl:.0f} {trend_str}"
 
             elif u_pos == "Short":
                 u_pnl = user_cost - current_close
@@ -232,15 +235,15 @@ class StrategyEngine:
                     
                     if u_prob > self.params['exit_threshold']:
                         user_advice = "🚀 建議出場"
-                        user_note = f"機率 {u_prob:.0%}"
+                        user_note = f"機率 {u_prob:.0%} {trend_str}"
                     else:
                         # 續抱狀態，檢查是否可加碼
                         if prob_short > self.params['entry_threshold'] and prob_short > prob_long:
                             user_advice = "⚓ 續抱 (🔥可加碼)"
-                            user_note = f"信心 {prob_short:.0%}"
+                            user_note = f"加碼信 {prob_short:.0%} {trend_str}"
                         else:
                             user_advice = "⚓ 建議續抱"
-                            user_note = f"帳 {u_pnl:.0f}"
+                            user_note = f"帳面 {u_pnl:.0f} {trend_str}"
 
             record = {
                 'Time': current_time,
@@ -412,12 +415,12 @@ with right_col:
                 use_container_width=True,
                 height=400,
                 column_config={
-                    "Time": "時間",
-                    "Close": "收盤價",
-                    "Strategy_Action": st.column_config.TextColumn("AI 自動策略", help="若 AI 全自動交易的操作"),
-                    "Strategy_Detail": "策略細節",
-                    "User_Advice": st.column_config.TextColumn("持單操作建議", help="針對左側設定的部位給出的建議"),
-                    "User_Note": "持單細節"
+                    "Time": st.column_config.TextColumn("時間", width="small"),
+                    "Close": st.column_config.NumberColumn("收盤價", format="%.0f", width="small"),
+                    "Strategy_Action": st.column_config.TextColumn("AI 自動策略", help="若 AI 全自動交易的操作", width="small"),
+                    "Strategy_Detail": st.column_config.TextColumn("策略細節", width="large"),
+                    "User_Advice": st.column_config.TextColumn("持單操作建議", help="針對左側設定的部位給出的建議", width="medium"),
+                    "User_Note": st.column_config.TextColumn("持單細節", width="large")
                 },
                 hide_index=True
             )
