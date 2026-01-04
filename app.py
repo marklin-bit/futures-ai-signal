@@ -418,9 +418,9 @@ with right_col:
                     "Time": st.column_config.TextColumn("時間", width="small"),
                     "Close": st.column_config.NumberColumn("收盤價", format="%.0f", width="small"),
                     "Strategy_Action": st.column_config.TextColumn("AI 自動策略", help="若 AI 全自動交易的操作", width="small"),
-                    "Strategy_Detail": st.column_config.TextColumn("策略細節", width="large"),
+                    "Strategy_Detail": st.column_config.TextColumn("策略細節", width="medium"),
                     "User_Advice": st.column_config.TextColumn("持單操作建議", help="針對左側設定的部位給出的建議", width="medium"),
-                    "User_Note": st.column_config.TextColumn("持單細節", width="large")
+                    "User_Note": st.column_config.TextColumn("持單細節", width="medium")
                 },
                 hide_index=True
             )
