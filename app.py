@@ -7,10 +7,10 @@ import plotly.graph_objects as go
 import os
 import io
 
-# 1. 網頁設定 (直接設定視窗標題，隱藏頁面內的大標題)
+# 1. 網頁設定
 st.set_page_config(page_title="AI 交易訊號戰情室", layout="wide", initial_sidebar_state="expanded")
 
-# CSS 美化 (縮減頂部空白，讓儀表板更緊湊)
+# CSS 美化
 st.markdown("""
     <style>
         .block-container {
@@ -50,86 +50,70 @@ class DataProcessor:
         self.exit_feature_cols = self.feature_cols + ['Floating_PnL', 'Hold_Bars']
 
     def validate_time_continuity(self, df):
-        """
-        [防呆機制] 檢查時間是否為連續的 5 分鐘
-        """
-        if 'Time' not in df.columns:
-            return [], "找不到時間欄位，無法檢查連續性。"
-        
+        if 'Time' not in df.columns: return [], "No Time Column"
         try:
-            # 嘗試轉換時間格式
             time_series = pd.to_datetime(df['Time'])
-            # 計算時間差
             diffs = time_series.diff()
-            
-            # 找出間隔不等於 5 分鐘的列 (排除第一筆 NaN)
-            # 5分鐘 = 300秒
-            # 容許跨日 (例如 13:45 -> 隔日 08:45)，但盤中必須連續
-            # 這裡做嚴格檢查：只要不是 5 分鐘就警示，使用者自行判斷是否為跨日
             discontinuous_indices = []
-            
             for i in range(1, len(diffs)):
                 delta = diffs.iloc[i]
-                if delta.total_seconds() != 300: # 300秒 = 5分鐘
-                    curr_time = time_series.iloc[i]
-                    prev_time = time_series.iloc[i-1]
-                    discontinuous_indices.append(f"{prev_time.strftime('%H:%M')} -> {curr_time.strftime('%H:%M')} (間隔 {delta})")
-            
+                if delta.total_seconds() != 300:
+                    curr = time_series.iloc[i].strftime('%H:%M')
+                    prev = time_series.iloc[i-1].strftime('%H:%M')
+                    discontinuous_indices.append(f"{prev} -> {curr}")
             return discontinuous_indices, None
-            
-        except Exception as e:
-            return [], f"時間格式解析失敗: {e}"
+        except: return [], "Error"
 
     def process(self):
-        if self.raw_df is None or self.raw_df.empty:
-            return pd.DataFrame(), [], []
-
+        if self.raw_df is None or self.raw_df.empty: return pd.DataFrame(), [], []
         df = self.raw_df.copy()
         df.columns = df.columns.astype(str)
         df.rename(columns=lambda x: x.replace('\n', '').strip(), inplace=True)
         
         clean_map = {}
         for col in df.columns:
-            if col in self.rename_map:
-                clean_map[col] = self.rename_map[col]
+            if col in self.rename_map: clean_map[col] = self.rename_map[col]
             else:
                 for k, v in self.rename_map.items():
-                    if k in col:
-                        clean_map[col] = v
-                        break
+                    if k in col: clean_map[col] = v; break
         df.rename(columns=clean_map, inplace=True)
         
-        # 欄位檢查
-        missing_features = []
+        missing = []
         for col in self.feature_cols:
-            if col not in df.columns:
-                missing_features.append(col)
-                df[col] = 0 
-            else:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
+            if col not in df.columns: missing.append(col); df[col] = 0
+            else: df[col] = pd.to_numeric(df[col], errors='coerce')
         
-        # 時間連續性檢查
-        discontinuities = []
-        if 'Time' in df.columns:
-            discontinuities, err = self.validate_time_continuity(df)
+        disc = []
+        if 'Time' in df.columns: disc, _ = self.validate_time_continuity(df)
         
         df.fillna(0, inplace=True)
         df.reset_index(drop=True, inplace=True)
-        return df, missing_features, discontinuities
+        return df, missing, disc
 
 class StrategyEngine:
     def __init__(self, df, models, params):
         self.df = df
         self.models = models
         self.params = params
+        self.processor = DataProcessor(None) # Helper
 
-    def run_historical_review(self):
-        position = 0 
-        entry_price = 0.0
-        entry_index = 0
+    def run_historical_review(self, user_pos_type, user_cost, user_bars):
+        """
+        同時計算：
+        1. 策略模擬 (Auto Strategy): AI 自己玩會怎麼做 (空手開始)
+        2. 持單建議 (User Advice): 假設使用者在該時間點持有特定部位，AI 建議為何 (含加碼偵測)
+        """
+        # 策略模擬變數
+        strat_pos = 0 
+        strat_entry_price = 0.0
+        strat_entry_index = 0
+        
+        # 使用者設定映射
+        pos_map = {"空手 (Empty)": "Empty", "多單 (Long)": "Long", "空單 (Short)": "Short"}
+        u_pos = pos_map.get(user_pos_type, "Empty")
         
         history_records = []
-        X_all = self.df[DataProcessor(None).feature_cols]
+        X_all = self.df[self.processor.feature_cols]
         
         for i in range(len(self.df)):
             current_bar = self.df.iloc[i]
@@ -137,80 +121,139 @@ class StrategyEngine:
             current_close = current_bar.get('Close', 0)
             current_time = current_bar.get('Time', f"K_{i}")
             
+            # 預先計算進場機率 (每一根都算，為了加碼判斷)
+            prob_long = self.models['Long_Entry_Model'].predict_proba(current_features)[0][1]
+            prob_short = self.models['Short_Entry_Model'].predict_proba(current_features)[0][1]
+
+            # --- 1. 計算策略模擬 (Strategy Simulation) ---
+            strat_action = "觀望"
+            strat_detail = ""
+
+            if strat_pos == 0:
+                if prob_long > self.params['entry_threshold'] and prob_long > prob_short:
+                    strat_pos = 1
+                    strat_entry_price = current_close
+                    strat_entry_index = i
+                    strat_action = "🔥 買進"
+                    strat_detail = f"多 {prob_long:.0%}"
+                elif prob_short > self.params['entry_threshold'] and prob_short > prob_long:
+                    strat_pos = -1
+                    strat_entry_price = current_close
+                    strat_entry_index = i
+                    strat_action = "⚡ 放空"
+                    strat_detail = f"空 {prob_short:.0%}"
+                else:
+                    strat_detail = f"M:{prob_long:.2f}/S:{prob_short:.2f}"
+
+            elif strat_pos == 1:
+                pnl = current_close - strat_entry_price
+                if pnl <= -self.params['hard_stop']:
+                    strat_pos = 0
+                    strat_action = "🛑 停損"
+                else:
+                    exit_feats = current_features.copy()
+                    exit_feats['Floating_PnL'] = pnl
+                    exit_feats['Hold_Bars'] = i - strat_entry_index
+                    exit_feats = exit_feats[self.processor.exit_feature_cols]
+                    prob = self.models['Long_Exit_Model'].predict_proba(exit_feats)[0][1]
+                    if prob > self.params['exit_threshold']:
+                        strat_pos = 0
+                        strat_action = "🟢 出場"
+                        strat_detail = f"率 {prob:.0%}"
+                    else:
+                        strat_action = "續抱"
+                        strat_detail = f"帳 {pnl:.0f}"
+
+            elif strat_pos == -1:
+                pnl = strat_entry_price - current_close
+                if pnl <= -self.params['hard_stop']:
+                    strat_pos = 0
+                    strat_action = "🛑 停損"
+                else:
+                    exit_feats = current_features.copy()
+                    exit_feats['Floating_PnL'] = pnl
+                    exit_feats['Hold_Bars'] = i - strat_entry_index
+                    exit_feats = exit_feats[self.processor.exit_feature_cols]
+                    prob = self.models['Short_Exit_Model'].predict_proba(exit_feats)[0][1]
+                    if prob > self.params['exit_threshold']:
+                        strat_pos = 0
+                        strat_action = "🔴 出場"
+                        strat_detail = f"率 {prob:.0%}"
+                    else:
+                        strat_action = "續抱"
+                        strat_detail = f"帳 {pnl:.0f}"
+
+            # --- 2. 計算使用者持單建議 (含加碼偵測) ---
+            user_advice = "-"
+            user_note = ""
+            
+            if u_pos == "Empty":
+                # 空手時，建議同進場模型
+                if prob_long > self.params['entry_threshold'] and prob_long > prob_short:
+                    user_advice = "🔥 建議買進"
+                    user_note = f"{prob_long:.0%}"
+                elif prob_short > self.params['entry_threshold'] and prob_short > prob_long:
+                    user_advice = "⚡ 建議放空"
+                    user_note = f"{prob_short:.0%}"
+                else:
+                    user_advice = "觀望"
+            
+            elif u_pos == "Long":
+                u_pnl = current_close - user_cost
+                if u_pnl <= -self.params['hard_stop']:
+                    user_advice = "🛑 觸發硬停損"
+                    user_note = f"{u_pnl:.0f}"
+                else:
+                    u_exit_feats = current_features.copy()
+                    u_exit_feats['Floating_PnL'] = u_pnl
+                    u_exit_feats['Hold_Bars'] = user_bars # 壓力測試值
+                    u_exit_feats = u_exit_feats[self.processor.exit_feature_cols]
+                    u_prob = self.models['Long_Exit_Model'].predict_proba(u_exit_feats)[0][1]
+                    
+                    if u_prob > self.params['exit_threshold']:
+                        user_advice = "🚀 建議出場"
+                        user_note = f"機率 {u_prob:.0%}"
+                    else:
+                        # 續抱狀態，檢查是否可加碼
+                        if prob_long > self.params['entry_threshold'] and prob_long > prob_short:
+                            user_advice = "⚓ 續抱 (🔥可加碼)"
+                            user_note = f"信心 {prob_long:.0%}"
+                        else:
+                            user_advice = "⚓ 建議續抱"
+                            user_note = f"帳 {u_pnl:.0f}"
+
+            elif u_pos == "Short":
+                u_pnl = user_cost - current_close
+                if u_pnl <= -self.params['hard_stop']:
+                    user_advice = "🛑 觸發硬停損"
+                    user_note = f"{u_pnl:.0f}"
+                else:
+                    u_exit_feats = current_features.copy()
+                    u_exit_feats['Floating_PnL'] = u_pnl
+                    u_exit_feats['Hold_Bars'] = user_bars
+                    u_exit_feats = u_exit_feats[self.processor.exit_feature_cols]
+                    u_prob = self.models['Short_Exit_Model'].predict_proba(u_exit_feats)[0][1]
+                    
+                    if u_prob > self.params['exit_threshold']:
+                        user_advice = "🚀 建議出場"
+                        user_note = f"機率 {u_prob:.0%}"
+                    else:
+                        # 續抱狀態，檢查是否可加碼
+                        if prob_short > self.params['entry_threshold'] and prob_short > prob_long:
+                            user_advice = "⚓ 續抱 (🔥可加碼)"
+                            user_note = f"信心 {prob_short:.0%}"
+                        else:
+                            user_advice = "⚓ 建議續抱"
+                            user_note = f"帳 {u_pnl:.0f}"
+
             record = {
-                'Index': i,
                 'Time': current_time,
                 'Close': current_close,
-                'Suggestion': '觀望',
-                'Confidence': 0.0,
-                'Detail': ''
+                'Strategy_Action': strat_action,
+                'Strategy_Detail': strat_detail,
+                'User_Advice': user_advice,
+                'User_Note': user_note
             }
-
-            if position == 0:
-                prob_long = self.models['Long_Entry_Model'].predict_proba(current_features)[0][1]
-                prob_short = self.models['Short_Entry_Model'].predict_proba(current_features)[0][1]
-                
-                if prob_long > self.params['entry_threshold'] and prob_long > prob_short:
-                    position = 1
-                    entry_price = current_close
-                    entry_index = i
-                    record['Suggestion'] = '🔥 買進'
-                    record['Confidence'] = prob_long
-                    record['Detail'] = f"做多 {prob_long:.0%}"
-                elif prob_short > self.params['entry_threshold'] and prob_short > prob_long:
-                    position = -1
-                    entry_price = current_close
-                    entry_index = i
-                    record['Suggestion'] = '⚡ 放空'
-                    record['Confidence'] = prob_short
-                    record['Detail'] = f"做空 {prob_short:.0%}"
-                else:
-                    record['Detail'] = f"多:{prob_long:.2f}/空:{prob_short:.2f}"
-
-            elif position == 1:
-                floating_pnl = current_close - entry_price
-                if floating_pnl <= -self.params['hard_stop']:
-                    position = 0
-                    record['Suggestion'] = '🛑 停損'
-                    record['Detail'] = f"損 {floating_pnl}"
-                else:
-                    exit_feats = current_features.copy()
-                    exit_feats['Floating_PnL'] = floating_pnl
-                    exit_feats['Hold_Bars'] = i - entry_index
-                    exit_feats = exit_feats[DataProcessor(None).exit_feature_cols]
-                    
-                    exit_prob = self.models['Long_Exit_Model'].predict_proba(exit_feats)[0][1]
-                    if exit_prob > self.params['exit_threshold']:
-                        position = 0
-                        record['Suggestion'] = '🟢 出場'
-                        record['Confidence'] = exit_prob
-                        record['Detail'] = f"率 {exit_prob:.0%}"
-                    else:
-                        record['Suggestion'] = '續抱'
-                        record['Detail'] = f"帳 {floating_pnl}"
-
-            elif position == -1:
-                floating_pnl = entry_price - current_close
-                if floating_pnl <= -self.params['hard_stop']:
-                    position = 0
-                    record['Suggestion'] = '🛑 停損'
-                    record['Detail'] = f"損 {floating_pnl}"
-                else:
-                    exit_feats = current_features.copy()
-                    exit_feats['Floating_PnL'] = floating_pnl
-                    exit_feats['Hold_Bars'] = i - entry_index
-                    exit_feats = exit_feats[DataProcessor(None).exit_feature_cols]
-
-                    exit_prob = self.models['Short_Exit_Model'].predict_proba(exit_feats)[0][1]
-                    if exit_prob > self.params['exit_threshold']:
-                        position = 0
-                        record['Suggestion'] = '🔴 出場'
-                        record['Confidence'] = exit_prob
-                        record['Detail'] = f"率 {exit_prob:.0%}"
-                    else:
-                        record['Suggestion'] = '續抱'
-                        record['Detail'] = f"帳 {floating_pnl}"
-            
             history_records.append(record)
             
         return pd.DataFrame(history_records)
@@ -222,10 +265,11 @@ class StrategyEngine:
         
         advice = {"Action": "Wait", "Confidence": 0.0, "PnL": 0.0, "Message": "資料不足", "Type": "Neutral"}
 
+        # 預先計算進場信心 (供加碼判斷用)
+        prob_long = self.models['Long_Entry_Model'].predict_proba(current_features)[0][1]
+        prob_short = self.models['Short_Entry_Model'].predict_proba(current_features)[0][1]
+
         if user_position == 'Empty':
-            prob_long = self.models['Long_Entry_Model'].predict_proba(current_features)[0][1]
-            prob_short = self.models['Short_Entry_Model'].predict_proba(current_features)[0][1]
-            
             if prob_long > self.params['entry_threshold'] and prob_long > prob_short:
                 advice.update({"Action": "Buy", "Confidence": prob_long, "Message": "🔥 多方訊號強勢，建議買進", "Type": "Buy"})
             elif prob_short > self.params['entry_threshold'] and prob_short > prob_long:
@@ -246,12 +290,15 @@ class StrategyEngine:
                 exit_feats = exit_feats[DataProcessor(None).exit_feature_cols]
                 
                 exit_prob = self.models['Long_Exit_Model'].predict_proba(exit_feats)[0][1]
-                advice['Confidence'] = exit_prob
                 
                 if exit_prob > self.params['exit_threshold']:
-                    advice.update({"Action": "Exit", "Message": f"🚀 AI 建議多單出場 (機率 {exit_prob:.0%})", "Type": "Exit"})
+                    advice.update({"Action": "Exit", "Confidence": exit_prob, "Message": f"🚀 AI 建議多單出場 (機率 {exit_prob:.0%})", "Type": "Exit"})
                 else:
-                    advice.update({"Action": "Hold", "Message": f"⚓ AI 建議續抱 (出場率 {exit_prob:.0%})", "Type": "Hold"})
+                    # 檢查加碼
+                    if prob_long > self.params['entry_threshold'] and prob_long > prob_short:
+                        advice.update({"Action": "Hold+", "Confidence": prob_long, "Message": "⚓ 續抱且出現多方訊號 (🔥可加碼)", "Type": "Buy"})
+                    else:
+                        advice.update({"Action": "Hold", "Confidence": 1-exit_prob, "Message": f"⚓ AI 建議續抱 (出場率 {exit_prob:.0%})", "Type": "Hold"})
 
         elif user_position == 'Short':
             floating_pnl = entry_price - current_close
@@ -266,12 +313,15 @@ class StrategyEngine:
                 exit_feats = exit_feats[DataProcessor(None).exit_feature_cols]
                 
                 exit_prob = self.models['Short_Exit_Model'].predict_proba(exit_feats)[0][1]
-                advice['Confidence'] = exit_prob
                 
                 if exit_prob > self.params['exit_threshold']:
-                    advice.update({"Action": "Exit", "Message": f"🚀 AI 建議空單出場 (機率 {exit_prob:.0%})", "Type": "Exit"})
+                    advice.update({"Action": "Exit", "Confidence": exit_prob, "Message": f"🚀 AI 建議空單出場 (機率 {exit_prob:.0%})", "Type": "Exit"})
                 else:
-                    advice.update({"Action": "Hold", "Message": f"⚓ AI 建議續抱 (出場率 {exit_prob:.0%})", "Type": "Hold"})
+                    # 檢查加碼
+                    if prob_short > self.params['entry_threshold'] and prob_short > prob_long:
+                        advice.update({"Action": "Hold+", "Confidence": prob_short, "Message": "⚓ 續抱且出現空方訊號 (🔥可加碼)", "Type": "Sell"})
+                    else:
+                        advice.update({"Action": "Hold", "Confidence": 1-exit_prob, "Message": f"⚓ AI 建議續抱 (出場率 {exit_prob:.0%})", "Type": "Hold"})
 
         return advice
 
@@ -280,41 +330,35 @@ class StrategyEngine:
 # ==========================================
 @st.cache_resource
 def load_models():
-    model_names = ['Long_Entry_Model', 'Short_Entry_Model', 'Long_Exit_Model', 'Short_Exit_Model']
-    loaded_models = {}
-    paths_to_try = ['', 'models/']
-    for name in model_names:
-        model = None
-        for path in paths_to_try:
-            file_path = f"{path}{name}.pkl"
-            if os.path.exists(file_path):
-                try: model = joblib.load(file_path); break
+    names = ['Long_Entry_Model', 'Short_Entry_Model', 'Long_Exit_Model', 'Short_Exit_Model']
+    loaded = {}
+    paths = ['', 'models/']
+    for name in names:
+        m = None
+        for p in paths:
+            if os.path.exists(f"{p}{name}.pkl"):
+                try: m = joblib.load(f"{p}{name}.pkl"); break
                 except: pass
-        if model: loaded_models[name] = model
+        if m: loaded[name] = m
         else: return None
-    return loaded_models
+    return loaded
 
 # ==========================================
-# 4. 網頁介面主邏輯 (儀表板佈局)
+# 4. 網頁介面主邏輯
 # ==========================================
-
-# 建立兩欄佈局：左側輸入(30%)，右側儀表板(70%)
 left_col, right_col = st.columns([1, 2.5])
-
 models = load_models()
 
-# --- 左側欄位：控制與輸入 ---
+# --- 左側：輸入與控制 ---
 with left_col:
     st.subheader("🛠️ 數據與參數")
-    
-    # 參數設定區
-    with st.expander("⚙️ 策略參數設定", expanded=False):
+    with st.expander("⚙️ 參數設定", expanded=False):
         entry_threshold = st.slider("進場信心", 0.5, 0.95, 0.80, 0.05)
         exit_threshold = st.slider("出場機率", 0.3, 0.9, 0.50, 0.05)
         hard_stop = st.number_input("硬停損點數", value=100, step=10)
 
-    # 部位設定區
     st.markdown("##### 👤 目前真實部位")
+    st.caption("設定後，右側表格將顯示針對此部位的歷史建議")
     user_pos_type = st.radio("持倉狀態", ["空手 (Empty)", "多單 (Long)", "空單 (Short)"], label_visibility="collapsed")
     user_entry_price = 0.0
     user_bars_held = 0
@@ -324,128 +368,89 @@ with left_col:
         user_bars_held = c2.number_input("K棒數", value=1, step=1, min_value=1)
 
     st.markdown("---")
-    
-    # 資料輸入區 (Tabs)
     tab1, tab2 = st.tabs(["📝 貼上資料", "🔄 即時串接"])
-    
     df_input = None
     with tab1:
-        st.caption("請從 Excel 複製含標題的數據 (時間, 收盤價, K, D, 布林, MA斜率...)")
+        st.caption("請從 Excel 複製含標題數據")
         paste_data = st.text_area("Ctrl+V 貼上區", height=250, label_visibility="collapsed")
         if paste_data:
-            try:
-                df_input = pd.read_csv(io.StringIO(paste_data), sep='\t')
+            try: df_input = pd.read_csv(io.StringIO(paste_data), sep='\t')
             except: st.error("格式錯誤")
-    
-    with tab2:
-        st.info("🚧 此功能開發中\n\n未來將透過 API 自動抓取報價，實現全自動訊號推播。")
+    with tab2: st.info("🚧 開發中")
 
-# --- 右側欄位：戰情儀表板 ---
+# --- 右側：歷史訊號列表 (優先) ---
 with right_col:
     if models is None:
-        st.error("⚠️ 模型載入失敗，請檢查 GitHub 檔案。")
-    
+        st.error("⚠️ 模型載入失敗")
     elif df_input is not None and not df_input.empty:
         processor = DataProcessor(df_input)
         df_clean, missing_cols, discontinuities = processor.process()
-        
-        # 1. 錯誤檢查
+
         if missing_cols:
-            st.error(f"❌ 資料缺少關鍵欄位：{missing_cols}")
+            st.error(f"❌ 缺少欄位：{missing_cols}")
         else:
             if discontinuities:
-                with st.expander(f"⚠️ 警告：偵測到 {len(discontinuities)} 處時間不連續", expanded=True):
-                    st.warning("請確認這是否為跨日或休市，否則技術指標可能失真。")
-                    st.write(discontinuities[:5]) # 只顯示前5個
+                with st.expander(f"⚠️ 時間不連續警示 ({len(discontinuities)})"):
+                    st.write(discontinuities[:5])
 
-            # 2. 執行策略
             params = {'entry_threshold': entry_threshold, 'exit_threshold': exit_threshold, 'hard_stop': hard_stop}
             engine = StrategyEngine(df_clean, models, params)
             
-            # 取得即時建議
-            pos_map = {"空手 (Empty)": "Empty", "多單 (Long)": "Long", "空單 (Short)": "Short"}
-            advice = engine.run_realtime_advice(pos_map[user_pos_type], user_entry_price, user_bars_held)
-            
-            # 取得歷史建議
-            df_history = engine.run_historical_review()
-            last_bar = df_clean.iloc[-1]
+            # 執行回測與建議計算
+            df_history = engine.run_historical_review(user_pos_type, user_entry_price, user_bars_held)
 
-            # --- A. 頂部關鍵數據卡片 ---
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("📊 最新時間", str(last_bar.get('Time', 'N/A'))[-5:]) # 只顯示 HH:MM
-            m2.metric("💰 收盤價", f"{last_bar.get('Close', 0):.0f}")
+            # --- A. 歷史訊號列表 (置頂) ---
+            st.subheader("📜 歷史訊號回放")
             
-            # 根據建議類型變色
-            delta_color = "off"
-            if advice['Type'] in ['Buy', 'Exit']: delta_color = "normal" # 綠色/上升
-            elif advice['Type'] in ['Sell', 'Stop']: delta_color = "inverse" # 紅色/下降
+            # 排序控制
+            c_sort, _ = st.columns([1, 2])
+            sort_order = c_sort.radio("排序方式", ["時間：新 → 舊 (倒序)", "時間：舊 → 新 (正序)"], horizontal=True, label_visibility="collapsed")
             
-            m3.metric("🤖 AI 決策", advice['Type'], delta=advice['Message'], delta_color=delta_color)
+            df_show = df_history.copy()
+            if "新 → 舊" in sort_order:
+                df_show = df_show.iloc[::-1] # 倒序
             
-            pnl_show = f"{advice['PnL']:.0f}" if user_pos_type != "空手 (Empty)" else "-"
-            m4.metric("🎯 信心/損益", f"{advice['Confidence']:.0%}", delta=pnl_show)
-
-            st.markdown("---")
-
-            # --- B. 視覺化圖表 (K線 + 訊號) ---
-            # 為了效能，只畫最後 60 根
-            display_len = 60
-            df_chart = df_clean.tail(display_len)
-            df_hist_chart = df_history.tail(display_len)
-            
-            fig = go.Figure()
-            # 價格線
-            fig.add_trace(go.Scatter(x=df_chart['Time'], y=df_chart['Close'], mode='lines+markers', name='Price', line=dict(color='#1f77b4')))
-            
-            # 標記歷史上的買賣建議 (為了不讓圖太亂，只標進場點)
-            buys = df_hist_chart[df_hist_chart['Suggestion'].str.contains('買進')]
-            sells = df_hist_chart[df_hist_chart['Suggestion'].str.contains('放空')]
-            
-            if not buys.empty:
-                fig.add_trace(go.Scatter(x=buys['Time'], y=buys['Close'], mode='markers', name='Buy Signal', marker=dict(symbol='triangle-up', size=15, color='red')))
-            if not sells.empty:
-                fig.add_trace(go.Scatter(x=sells['Time'], y=sells['Close'], mode='markers', name='Sell Signal', marker=dict(symbol='triangle-down', size=15, color='green')))
-
-            fig.update_layout(
-                title="近 60 根 K 棒走勢與歷史訊號",
-                margin=dict(l=0, r=0, t=30, b=0),
-                height=350,
-                xaxis_type='category' # 避免時間不連續產生的空白
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-            # --- C. 歷史建議表格 ---
-            st.subheader("📜 歷史訊號回放 (倒序)")
-            
-            # 格式化表格，讓它更像看盤軟體的明細
-            df_show = df_history[['Time', 'Close', 'Suggestion', 'Detail']].iloc[::-1] # 倒序
-            
-            # 使用 dataframe 的 column config 加上顏色條或圖示
+            # 使用 column_config 優化顯示
             st.dataframe(
                 df_show,
                 use_container_width=True,
-                height=300,
+                height=400,
                 column_config={
-                    "Suggestion": st.column_config.TextColumn(
-                        "AI 建議",
-                        help="當時 AI 給出的操作建議",
-                    ),
-                    "Confidence": st.column_config.ProgressColumn(
-                        "信心度",
-                        format="%.2f",
-                        min_value=0,
-                        max_value=1,
-                    ),
-                }
+                    "Time": "時間",
+                    "Close": "收盤價",
+                    "Strategy_Action": st.column_config.TextColumn("AI 自動策略", help="若 AI 全自動交易的操作"),
+                    "Strategy_Detail": "策略細節",
+                    "User_Advice": st.column_config.TextColumn("持單操作建議", help="針對左側設定的部位給出的建議"),
+                    "User_Note": "持單細節"
+                },
+                hide_index=True
             )
 
+            # --- B. 視覺化圖表 (移至下方) ---
+            st.markdown("---")
+            st.subheader("📊 近 60 根 K 棒走勢")
+            
+            df_chart = df_clean.tail(60)
+            # 為了標記，我們需要對應的歷史紀錄
+            df_hist_chart = df_history.tail(60)
+            
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=df_chart['Time'], y=df_chart['Close'], mode='lines+markers', name='Price', line=dict(color='#1f77b4', width=2)))
+            
+            # 標記自動策略的買賣點
+            buys = df_hist_chart[df_hist_chart['Strategy_Action'].str.contains('買進')]
+            sells = df_hist_chart[df_hist_chart['Strategy_Action'].str.contains('放空')]
+            exits = df_hist_chart[df_hist_chart['Strategy_Action'].str.contains('出場')]
+            
+            if not buys.empty:
+                fig.add_trace(go.Scatter(x=buys['Time'], y=buys['Close'], mode='markers', name='Buy', marker=dict(symbol='triangle-up', size=15, color='red')))
+            if not sells.empty:
+                fig.add_trace(go.Scatter(x=sells['Time'], y=sells['Close'], mode='markers', name='Sell', marker=dict(symbol='triangle-down', size=15, color='green')))
+            if not exits.empty:
+                fig.add_trace(go.Scatter(x=exits['Time'], y=exits['Close'], mode='markers', name='Exit', marker=dict(symbol='x', size=12, color='orange')))
+            
+            fig.update_layout(margin=dict(l=0, r=0, t=10, b=0), height=350, xaxis_type='category')
+            st.plotly_chart(fig, use_container_width=True)
+
     else:
-        # 空白狀態的引導畫面
-        st.info("👈 請先在左側貼上 Excel 資料以啟動戰情室")
-        st.markdown("""
-        ### 🚀 快速上手指南
-        1. **複製資料**：從您的 Excel 或看盤軟體複製包含技術指標的數據。
-        2. **貼上**：貼到左側的文字框中。
-        3. **設定部位**：如果您手上已有單，請在左側設定，AI 會切換為「出場模式」。
-        4. **看訊號**：右側儀表板會即時顯示最新建議。
-        """)
+        st.info("👈 請在左側貼上資料以開始")
