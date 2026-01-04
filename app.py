@@ -302,79 +302,6 @@ class StrategyEngine:
             
         return pd.DataFrame(history_records)
 
-    def run_realtime_advice(self, user_position, entry_time_obj):
-        last_idx = len(self.df) - 1
-        current_features = self.df.iloc[[last_idx]][DataProcessor(None).feature_cols].copy()
-        current_close = self.df.iloc[last_idx].get('Close', 0)
-        
-        advice = {"Action": "Wait", "Confidence": 0.0, "PnL": 0.0, "Message": "資料不足", "Type": "Neutral", "Label": "進場信心"}
-
-        prob_long = self.models['Long_Entry_Model'].predict_proba(current_features)[0][1]
-        prob_short = self.models['Short_Entry_Model'].predict_proba(current_features)[0][1]
-
-        if user_position == 'Empty':
-            advice["Label"] = "進場信心"
-            if prob_long > self.params['entry_threshold'] and prob_long > prob_short:
-                advice.update({"Action": "Buy", "Confidence": prob_long, "Message": "🔥 多方強勢，建議買進", "Type": "Buy"})
-            elif prob_short > self.params['entry_threshold'] and prob_short > prob_long:
-                advice.update({"Action": "Sell", "Confidence": prob_short, "Message": "⚡ 空方強勢，建議放空", "Type": "Sell"})
-            else:
-                advice.update({"Action": "Wait", "Confidence": max(prob_long, prob_short), "Message": f"觀望 (多:{prob_long:.2f}/空:{prob_short:.2f})", "Type": "Wait"})
-        else:
-            user_entry_idx, entry_price = self.find_entry_info(entry_time_obj)
-            bars_held = 0
-            if user_entry_idx != -1 and last_idx >= user_entry_idx:
-                bars_held = last_idx - user_entry_idx
-            if bars_held < 0: bars_held = 0
-
-            if user_position == 'Long':
-                floating_pnl = current_close - entry_price
-                advice['PnL'] = floating_pnl
-                
-                if floating_pnl <= -self.params['hard_stop']:
-                    advice.update({"Action": "StopLoss", "Confidence": 1.0, "Message": f"🛑 觸發硬停損 (-{self.params['hard_stop']})", "Type": "Stop", "Label": "停損觸發"})
-                else:
-                    exit_feats = current_features.copy()
-                    exit_feats['Floating_PnL'] = floating_pnl
-                    exit_feats['Hold_Bars'] = bars_held
-                    exit_feats = exit_feats[DataProcessor(None).exit_feature_cols]
-                    
-                    exit_prob = self.models['Long_Exit_Model'].predict_proba(exit_feats)[0][1]
-                    
-                    if exit_prob > self.params['exit_threshold']:
-                        advice.update({"Action": "Exit", "Confidence": exit_prob, "Message": f"🚀 建議多單出場 (機率 {exit_prob:.0%})", "Type": "Exit", "Label": "出場機率"})
-                    else:
-                        hold_conf = 1.0 - exit_prob
-                        if prob_long > self.params['entry_threshold'] and prob_long > prob_short:
-                            advice.update({"Action": "Hold+", "Confidence": prob_long, "Message": "⚓ 續抱且出現多方訊號 (🔥可加碼)", "Type": "Buy", "Label": "加碼信心"})
-                        else:
-                            advice.update({"Action": "Hold", "Confidence": hold_conf, "Message": f"⚓ 建議續抱 (安心度 {hold_conf:.0%})", "Type": "Hold", "Label": "續抱信心"})
-
-            elif user_position == 'Short':
-                floating_pnl = entry_price - current_close
-                advice['PnL'] = floating_pnl
-                
-                if floating_pnl <= -self.params['hard_stop']:
-                    advice.update({"Action": "StopLoss", "Confidence": 1.0, "Message": f"🛑 觸發硬停損 (-{self.params['hard_stop']})", "Type": "Stop", "Label": "停損觸發"})
-                else:
-                    exit_feats = current_features.copy()
-                    exit_feats['Floating_PnL'] = floating_pnl
-                    exit_feats['Hold_Bars'] = bars_held
-                    exit_feats = exit_feats[DataProcessor(None).exit_feature_cols]
-                    
-                    exit_prob = self.models['Short_Exit_Model'].predict_proba(exit_feats)[0][1]
-                    
-                    if exit_prob > self.params['exit_threshold']:
-                        advice.update({"Action": "Exit", "Confidence": exit_prob, "Message": f"🚀 建議空單出場 (機率 {exit_prob:.0%})", "Type": "Exit", "Label": "出場機率"})
-                    else:
-                        hold_conf = 1.0 - exit_prob
-                        if prob_short > self.params['entry_threshold'] and prob_short > prob_long:
-                            advice.update({"Action": "Hold+", "Confidence": prob_short, "Message": "⚓ 續抱且出現空方訊號 (🔥可加碼)", "Type": "Sell", "Label": "加碼信心"})
-                        else:
-                            advice.update({"Action": "Hold", "Confidence": hold_conf, "Message": f"⚓ 建議續抱 (安心度 {hold_conf:.0%})", "Type": "Hold", "Label": "續抱信心"})
-
-        return advice
-
 # ==========================================
 # 3. 載入模型
 # ==========================================
@@ -444,27 +371,9 @@ with right_col:
             params = {'entry_threshold': entry_threshold, 'exit_threshold': exit_threshold, 'hard_stop': hard_stop}
             engine = StrategyEngine(df_clean, models, params)
             
+            # 執行回測與建議計算
             df_history = engine.run_historical_review(user_pos_type, user_entry_time)
             
-            # 取得即時建議
-            pos_map_key = {"空手 (Empty)": "Empty", "多單 (Long)": "Long", "空單 (Short)": "Short"}[user_pos_type]
-            advice = engine.run_realtime_advice(pos_map_key, user_entry_time)
-
-            # --- Dashboard ---
-            st.markdown("---")
-            last_row = df_clean.iloc[-1]
-            
-            m1, m2, m3 = st.columns([1, 1.5, 1.5])
-            m1.metric("📊 最新時間", str(last_row.get('Time', 'N/A'))[-5:]) 
-            
-            delta_color = "off"
-            if advice['Type'] in ['Buy', 'Exit']: delta_color = "normal"
-            elif advice['Type'] in ['Sell', 'Stop']: delta_color = "inverse"
-            m2.metric("🤖 AI 決策", advice['Type'], delta=advice['Message'], delta_color=delta_color)
-            
-            pnl_show = f"{advice['PnL']:.0f}" if user_pos_type != "空手 (Empty)" else "-"
-            m3.metric(f"🎯 {advice['Label']}/損益", f"{advice['Confidence']:.0%}", delta=pnl_show)
-
             # --- A. 歷史訊號列表 (置頂) ---
             st.subheader("📜 歷史訊號回放")
             
