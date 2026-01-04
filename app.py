@@ -103,11 +103,16 @@ class StrategyEngine:
         根據時間物件 (datetime.time) 尋找對應的 Index 和 Close Price
         """
         if entry_time_obj is None: return -1, 0.0
+        
+        # 將 time 物件轉為字串 "HH:MM"
         time_str = entry_time_obj.strftime("%H:%M")
+        
+        # 在 df['Time'] 中尋找包含此時間字串的列
         mask = self.df['Time'].astype(str).str.contains(time_str, na=False)
         matches = self.df[mask]
+        
         if not matches.empty:
-            idx = matches.index[-1]
+            idx = matches.index[-1] # 取最後一筆
             price = matches.loc[idx, 'Close']
             return idx, price
         return -1, 0.0
@@ -125,6 +130,7 @@ class StrategyEngine:
         # 自動查找成本與 Index
         user_entry_idx = -1
         user_cost = 0.0
+        
         if u_pos != "Empty":
             user_entry_idx, user_cost = self.find_entry_info(entry_time_obj)
 
@@ -177,7 +183,7 @@ class StrategyEngine:
                     prob = self.models['Long_Exit_Model'].predict_proba(exit_feats)[0][1]
                     if prob > self.params['exit_threshold']:
                         strat_pos = 0
-                        strat_action = "🟢 多出" # 多單出場(賣) -> 綠色
+                        strat_action = "❌ 多出" # 紅色叉叉
                         strat_detail = f"出場率 {prob:.0%} {trend_str}"
                     else:
                         strat_action = "⏳ 續抱"
@@ -197,13 +203,13 @@ class StrategyEngine:
                     prob = self.models['Short_Exit_Model'].predict_proba(exit_feats)[0][1]
                     if prob > self.params['exit_threshold']:
                         strat_pos = 0
-                        strat_action = "🔴 空出" # 空單出場(買) -> 紅色
+                        strat_action = "❎ 空出" # 綠色叉叉
                         strat_detail = f"出場率 {prob:.0%} {trend_str}"
                     else:
                         strat_action = "⏳ 續抱"
                         strat_detail = f"帳面 {pnl:.0f} {trend_str}"
 
-            # --- 2. 計算使用者持單建議 (User Advice) [🟥/🟩 方形系統] ---
+            # --- 2. 計算使用者持單建議 (User Advice) ---
             user_advice = "-"
             user_note = ""
             
@@ -221,9 +227,9 @@ class StrategyEngine:
             
             elif i == user_entry_idx:
                 if u_pos == "Long":
-                    user_advice = "🟥 多單進場" 
+                    user_advice = "🔴 多單進場" 
                 else:
-                    user_advice = "🟩 空單進場"
+                    user_advice = "🟢 空單進場"
                 user_note = f"成本 {user_cost:.0f}"
 
             else:
@@ -251,10 +257,10 @@ class StrategyEngine:
                             user_note = f"出場率 {u_prob:.0%} {trend_str}"
                         else:
                             if prob_long > self.params['entry_threshold'] and prob_long > prob_short:
-                                user_advice = "🟥 加碼"
+                                user_advice = "🔥 加碼"
                                 user_note = status_str
                             else:
-                                user_advice = "🟥 續抱"
+                                user_advice = "⏳ 續抱"
                                 user_note = status_str
 
                 elif u_pos == "Short":
@@ -277,10 +283,10 @@ class StrategyEngine:
                             user_note = f"出場率 {u_prob:.0%} {trend_str}"
                         else:
                             if prob_short > self.params['entry_threshold'] and prob_short > prob_long:
-                                user_advice = "🟩 加碼"
+                                user_advice = "🔥 加碼"
                                 user_note = status_str
                             else:
-                                user_advice = "🟩 續抱"
+                                user_advice = "⏳ 續抱"
                                 user_note = status_str
 
             record = {
@@ -493,21 +499,19 @@ with right_col:
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=df_chart['Time'], y=df_chart['Close'], mode='lines+markers', name='Price', line=dict(color='#1f77b4', width=2)))
             
-            # 策略點標記
             buys = df_hist_chart[df_hist_chart['Strategy_Action'].str.contains('買進')]
             sells = df_hist_chart[df_hist_chart['Strategy_Action'].str.contains('放空')]
             exits_long = df_hist_chart[df_hist_chart['Strategy_Action'].str.contains('多出')]
             exits_short = df_hist_chart[df_hist_chart['Strategy_Action'].str.contains('空出')]
             
-            # 紅買/綠賣
             if not buys.empty:
                 fig.add_trace(go.Scatter(x=buys['Time'], y=buys['Close'], mode='markers', name='Buy', marker=dict(symbol='triangle-up', size=15, color='red')))
             if not sells.empty:
                 fig.add_trace(go.Scatter(x=sells['Time'], y=sells['Close'], mode='markers', name='Sell', marker=dict(symbol='triangle-down', size=15, color='green')))
             if not exits_long.empty:
-                fig.add_trace(go.Scatter(x=exits_long['Time'], y=exits_long['Close'], mode='markers', name='Exit Long', marker=dict(symbol='x', size=12, color='green')))
+                fig.add_trace(go.Scatter(x=exits_long['Time'], y=exits_long['Close'], mode='markers', name='Exit Long', marker=dict(symbol='x', size=12, color='red')))
             if not exits_short.empty:
-                fig.add_trace(go.Scatter(x=exits_short['Time'], y=exits_short['Close'], mode='markers', name='Exit Short', marker=dict(symbol='x', size=12, color='red')))
+                fig.add_trace(go.Scatter(x=exits_short['Time'], y=exits_short['Close'], mode='markers', name='Exit Short', marker=dict(symbol='x', size=12, color='green')))
             
             # [Added] 標記真實部位進場點
             real_entry_idx, _ = engine.find_entry_info(user_entry_time)
