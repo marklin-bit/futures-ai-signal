@@ -178,7 +178,7 @@ class StrategyEngine:
                     if prob > self.params['exit_threshold']:
                         strat_pos = 0
                         strat_action = "❌ 多出" 
-                        strat_detail = f"出場率 {prob:.0%} {trend_str}"
+                        strat_detail = f"帳面{pnl:.0f}(出:{prob:.0%}/多:{prob_long:.0%}/空:{prob_short:.0%})"
                     else:
                         strat_action = "⏳ 續抱"
                         hold_conf = 1.0 - prob
@@ -199,7 +199,7 @@ class StrategyEngine:
                     if prob > self.params['exit_threshold']:
                         strat_pos = 0
                         strat_action = "❎ 空出" 
-                        strat_detail = f"出場率 {prob:.0%} {trend_str}"
+                        strat_detail = f"帳面{pnl:.0f}(出:{prob:.0%}/多:{prob_long:.0%}/空:{prob_short:.0%})"
                     else:
                         strat_action = "⏳ 續抱"
                         hold_conf = 1.0 - prob
@@ -244,18 +244,19 @@ class StrategyEngine:
                         u_prob = self.models['Long_Exit_Model'].predict_proba(u_exit_feats)[0][1]
                         hold_conf = 1.0 - u_prob
                         
-                        status_str = f"帳面{u_pnl:.0f}(續:{hold_conf:.0%}/多:{prob_long:.0%}/空:{prob_short:.0%})"
+                        status_str_hold = f"帳面{u_pnl:.0f}(續:{hold_conf:.0%}/多:{prob_long:.0%}/空:{prob_short:.0%})"
+                        status_str_exit = f"帳面{u_pnl:.0f}(出:{u_prob:.0%}/多:{prob_long:.0%}/空:{prob_short:.0%})"
                         
                         if u_prob > self.params['exit_threshold']:
-                            user_advice = "🏃 出場"
-                            user_note = f"出場率 {u_prob:.0%} {trend_str}"
+                            user_advice = "❌ 出場" # [Modify] 紅色叉叉 (多單出場)
+                            user_note = status_str_exit
                         else:
                             if prob_long > self.params['entry_threshold'] and prob_long > prob_short:
                                 user_advice = "🔥 加碼"
-                                user_note = status_str
+                                user_note = status_str_hold
                             else:
                                 user_advice = "⏳ 續抱"
-                                user_note = status_str
+                                user_note = status_str_hold
 
                 elif u_pos == "Short":
                     u_pnl = user_cost - current_close
@@ -270,18 +271,19 @@ class StrategyEngine:
                         u_prob = self.models['Short_Exit_Model'].predict_proba(u_exit_feats)[0][1]
                         hold_conf = 1.0 - u_prob
                         
-                        status_str = f"帳面{u_pnl:.0f}(續:{hold_conf:.0%}/多:{prob_long:.0%}/空:{prob_short:.0%})"
+                        status_str_hold = f"帳面{u_pnl:.0f}(續:{hold_conf:.0%}/多:{prob_long:.0%}/空:{prob_short:.0%})"
+                        status_str_exit = f"帳面{u_pnl:.0f}(出:{u_prob:.0%}/多:{prob_long:.0%}/空:{prob_short:.0%})"
                         
                         if u_prob > self.params['exit_threshold']:
-                            user_advice = "🏃 出場"
-                            user_note = f"出場率 {u_prob:.0%} {trend_str}"
+                            user_advice = "❎ 出場" # [Modify] 綠色叉叉 (空單出場)
+                            user_note = status_str_exit
                         else:
                             if prob_short > self.params['entry_threshold'] and prob_short > prob_long:
                                 user_advice = "🔥 加碼"
-                                user_note = status_str
+                                user_note = status_str_hold
                             else:
                                 user_advice = "⏳ 續抱"
-                                user_note = status_str
+                                user_note = status_str_hold
 
             record = {
                 'Time': current_time,
@@ -437,6 +439,7 @@ with right_col:
             params = {'entry_threshold': entry_threshold, 'exit_threshold': exit_threshold, 'hard_stop': hard_stop}
             engine = StrategyEngine(df_clean, models, params)
             
+            # 執行回測與建議計算
             df_history = engine.run_historical_review(user_pos_type, user_entry_time)
             
             # --- A. 歷史訊號列表 (置頂) ---
