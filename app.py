@@ -22,7 +22,8 @@ class DataProcessor:
             'K', 'D', 'Position_in_Channel', 'Volatility', 
             'K_Strength', 'Body_Ratio', 'Week', 'Settlement_Day', 'Time_Segment'
         ]
-        # 定義中文對照
+        # 定義中文對照 (方便使用者上傳原始檔)
+        # 鍵值(Key)是使用者Excel可能的欄位名，值(Value)是程式內部用的英文名
         self.rename_map = {
             '布林通道寬度': 'Bandwidth', 'MA斜率\n0平/1上/-1下': 'MA_Slope', 'MA斜率': 'MA_Slope',
             '布林帶寬度變化率': 'Bandwidth_Rate', '相對成交量': 'Rel_Volume',
@@ -40,32 +41,40 @@ class DataProcessor:
 
     def process(self):
         if self.raw_df is None or self.raw_df.empty:
-            return pd.DataFrame()
+            return pd.DataFrame(), []
 
         df = self.raw_df.copy()
+        
+        # 1. 欄位更名
+        # 先轉字串處理換行
         df.columns = df.columns.astype(str)
         df.rename(columns=lambda x: x.replace('\n', '').strip(), inplace=True)
         
         clean_map = {}
         for col in df.columns:
+            # 嘗試完全比對
             if col in self.rename_map:
                 clean_map[col] = self.rename_map[col]
             else:
+                # 嘗試部分比對 (例如 "MA斜率" in "MA斜率\n0平...")
                 for k, v in self.rename_map.items():
                     if k in col:
                         clean_map[col] = v
                         break
         df.rename(columns=clean_map, inplace=True)
         
+        # 2. 檢查是否有缺漏的關鍵欄位
+        missing_features = []
         for col in self.feature_cols:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
+            if col not in df.columns:
+                missing_features.append(col)
+                df[col] = 0 # 暫時補0防崩潰，但會回傳缺失清單
             else:
-                df[col] = 0
+                df[col] = pd.to_numeric(df[col], errors='coerce')
         
         df.fillna(0, inplace=True)
         df.reset_index(drop=True, inplace=True)
-        return df
+        return df, missing_features
 
 class StrategyEngine:
     def __init__(self, df, models, params):
@@ -76,7 +85,6 @@ class StrategyEngine:
     def run_historical_review(self):
         """
         模擬從第一筆資料開始跑到最後一筆 (歷史回放)
-        這可以回答: 08:45 當時建議什麼? 08:50 當時建議什麼?
         """
         position = 0 
         entry_price = 0.0
@@ -311,11 +319,15 @@ if models is None:
 
 # --- 資料輸入區塊 ---
 st.subheader("📋 資料輸入")
+st.info("💡 提示：Excel 複製時，請務必包含以下「關鍵欄位標題」(順序不拘)：\n"
+        "收盤時間, 收盤價, K值, D值, 布林通道寬度, MA斜率, "
+        "相對成交量, 通道位置, 波動率, K棒強度, 實體佔比, 星期, 結算日, 時段")
+
 tab1, tab2 = st.tabs(["📝 貼上 Excel 資料", "📂 上傳 CSV 檔案"])
 
 df_input = None
 with tab1:
-    st.caption("請從 Excel 複製資料 (含標題) 貼上。模型會自動分析每一列的歷史建議。")
+    st.caption("請從 Excel 複製資料 (含標題) 貼上。")
     paste_data = st.text_area("貼上區 (Ctrl+V):", height=150)
     if paste_data:
         try:
@@ -332,17 +344,23 @@ with tab2:
 # --- 執行分析 ---
 if df_input is not None and not df_input.empty:
     processor = DataProcessor(df_input)
-    df_clean = processor.process()
+    # process 現在會回傳兩個值：資料表 和 缺失欄位清單
+    df_clean, missing_cols = processor.process()
+    
+    # 檢查是否有缺失欄位，並發出警告
+    if missing_cols:
+        st.error(f"❌ 嚴重警告：偵測到資料缺少以下關鍵欄位，模型將無法正確運作！\n"
+                 f"缺失欄位: {missing_cols}")
+        st.stop() # 強制停止，避免算出錯誤數據
     
     params = {'entry_threshold': entry_threshold, 'exit_threshold': exit_threshold, 'hard_stop': hard_stop}
     engine = StrategyEngine(df_clean, models, params)
 
-    # 1. 取得即時建議 (針對最後一筆 + 使用者設定)
-    # Mapping user selection to code format
+    # 1. 取得即時建議
     pos_map = {"空手 (Empty)": "Empty", "多單 (Long)": "Long", "空單 (Short)": "Short"}
     realtime_advice = engine.run_realtime_advice(pos_map[user_pos_type], user_entry_price, user_bars_held)
 
-    # 2. 取得歷史回放 (針對每一筆，模擬從頭到尾的狀況)
+    # 2. 取得歷史回放
     df_history = engine.run_historical_review()
 
     # --- Dashboard 顯示 ---
