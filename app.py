@@ -200,7 +200,7 @@ class StrategyEngine:
             elif u_pos == "Long":
                 u_pnl = current_close - user_cost
                 if u_pnl <= -self.params['hard_stop']:
-                    user_advice = "🛑 觸發硬停損"
+                    user_advice = "🛑 停損"
                     user_note = f"{u_pnl:.0f}"
                 else:
                     u_exit_feats = current_features.copy()
@@ -210,21 +210,21 @@ class StrategyEngine:
                     u_prob = self.models['Long_Exit_Model'].predict_proba(u_exit_feats)[0][1]
                     
                     if u_prob > self.params['exit_threshold']:
-                        user_advice = "🚀 建議出場"
+                        user_advice = "🚀 出場"
                         user_note = f"機率 {u_prob:.0%} {trend_str}"
                     else:
                         # 續抱狀態，檢查是否可加碼
                         if prob_long > self.params['entry_threshold'] and prob_long > prob_short:
-                            user_advice = "⚓ 續抱 (🔥可加碼)"
+                            user_advice = "🔥 加碼"
                             user_note = f"加碼信 {prob_long:.0%} {trend_str}"
                         else:
-                            user_advice = "⚓ 建議續抱"
+                            user_advice = "⚓ 續抱"
                             user_note = f"帳面 {u_pnl:.0f} {trend_str}"
 
             elif u_pos == "Short":
                 u_pnl = user_cost - current_close
                 if u_pnl <= -self.params['hard_stop']:
-                    user_advice = "🛑 觸發硬停損"
+                    user_advice = "🛑 停損"
                     user_note = f"{u_pnl:.0f}"
                 else:
                     u_exit_feats = current_features.copy()
@@ -234,15 +234,15 @@ class StrategyEngine:
                     u_prob = self.models['Short_Exit_Model'].predict_proba(u_exit_feats)[0][1]
                     
                     if u_prob > self.params['exit_threshold']:
-                        user_advice = "🚀 建議出場"
+                        user_advice = "🚀 出場"
                         user_note = f"機率 {u_prob:.0%} {trend_str}"
                     else:
                         # 續抱狀態，檢查是否可加碼
                         if prob_short > self.params['entry_threshold'] and prob_short > prob_long:
-                            user_advice = "⚓ 續抱 (🔥可加碼)"
+                            user_advice = "🔥 加碼"
                             user_note = f"加碼信 {prob_short:.0%} {trend_str}"
                         else:
-                            user_advice = "⚓ 建議續抱"
+                            user_advice = "⚓ 續抱"
                             user_note = f"帳面 {u_pnl:.0f} {trend_str}"
 
             record = {
@@ -417,9 +417,9 @@ with right_col:
                 column_config={
                     "Time": st.column_config.TextColumn("時間", width="small"),
                     "Close": st.column_config.NumberColumn("收盤價", format="%.0f", width="small"),
-                    "Strategy_Action": st.column_config.TextColumn("AI 自動策略", help="若 AI 全自動交易的操作", width="small"),
+                    "Strategy_Action": st.column_config.TextColumn("模型策略", help="若 AI 全自動交易的操作", width="small"),
                     "Strategy_Detail": st.column_config.TextColumn("策略細節", width="medium"),
-                    "User_Advice": st.column_config.TextColumn("持單操作建議", help="針對左側設定的部位給出的建議", width="medium"),
+                    "User_Advice": st.column_config.TextColumn("持單建議", help="針對左側設定的部位給出的建議", width="small"),
                     "User_Note": st.column_config.TextColumn("持單細節", width="medium")
                 },
                 hide_index=True
