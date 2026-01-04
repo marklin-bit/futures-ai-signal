@@ -53,7 +53,8 @@ class DataProcessor:
     def validate_time_continuity(self, df):
         if 'Time' not in df.columns: return [], "No Time Column"
         try:
-            time_series = pd.to_datetime(df['Time'])
+            # 這裡 df['Time'] 已經是 datetime 物件，直接使用
+            time_series = df['Time']
             diffs = time_series.diff()
             discontinuous_indices = []
             for i in range(1, len(diffs)):
@@ -79,6 +80,13 @@ class DataProcessor:
                     if k in col: clean_map[col] = v; break
         df.rename(columns=clean_map, inplace=True)
         
+        # [Fix] 強制轉換時間欄位為 datetime 物件，解決排序問題
+        if 'Time' in df.columns:
+            try:
+                df['Time'] = pd.to_datetime(df['Time'])
+            except:
+                pass # 若轉換失敗則維持原樣(可能導致排序不準)
+
         missing = []
         for col in self.feature_cols:
             if col not in df.columns: missing.append(col); df[col] = 0
@@ -108,6 +116,7 @@ class StrategyEngine:
         time_str = entry_time_obj.strftime("%H:%M")
         
         # 在 df['Time'] 中尋找包含此時間字串的列
+        # 因為 df['Time'] 現在是 datetime 物件，需轉字串比對
         mask = self.df['Time'].astype(str).str.contains(time_str, na=False)
         matches = self.df[mask]
         
@@ -377,7 +386,6 @@ with right_col:
             # --- A. 歷史訊號列表 (置頂) ---
             st.subheader("📜 歷史訊號回放")
             
-            # [Removed] 移除 radio 排序選項，改為預設倒序
             df_show = df_history.copy()
             df_show = df_show.iloc[::-1] # 預設倒序
             
@@ -386,7 +394,8 @@ with right_col:
                 use_container_width=True,
                 height=400,
                 column_config={
-                    "Time": st.column_config.TextColumn("時間", width="small"),
+                    # [Fix] 使用 DatetimeColumn 確保時間欄位可以正確排序
+                    "Time": st.column_config.DatetimeColumn("時間", format="MM-DD HH:mm", width="small"),
                     "Close": st.column_config.NumberColumn("收盤價", format="%.0f", width="small"),
                     "Strategy_Action": st.column_config.TextColumn("模型策略", help="若 AI 全自動交易的操作", width="small"),
                     "Strategy_Detail": st.column_config.TextColumn("策略細節", width="medium"),
