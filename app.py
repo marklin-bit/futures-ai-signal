@@ -14,7 +14,7 @@ st.set_page_config(page_title="AI 交易訊號戰情室", layout="wide", initial
 st.markdown("""
     <style>
         .block-container {
-            padding-top: 1rem;
+            padding-top: 3rem;
             padding-bottom: 1rem;
         }
         div[data-testid="stMetricValue"] {
@@ -143,7 +143,7 @@ class StrategyEngine:
                     strat_action = "⚡ 放空"
                     strat_detail = f"空 {prob_short:.0%}"
                 else:
-                    strat_detail = f"M:{prob_long:.2f}/S:{prob_short:.2f}"
+                    strat_detail = f"多:{prob_long:.0%} / 空:{prob_short:.0%}"
 
             elif strat_pos == 1:
                 pnl = current_close - strat_entry_price
@@ -190,10 +190,10 @@ class StrategyEngine:
             if u_pos == "Empty":
                 # 空手時，建議同進場模型
                 if prob_long > self.params['entry_threshold'] and prob_long > prob_short:
-                    user_advice = "🔥 建議買進"
+                    user_advice = "🔥 訊號：買進"
                     user_note = f"{prob_long:.0%}"
                 elif prob_short > self.params['entry_threshold'] and prob_short > prob_long:
-                    user_advice = "⚡ 建議放空"
+                    user_advice = "⚡ 訊號：放空"
                     user_note = f"{prob_short:.0%}"
                 else:
                     user_advice = "觀望"
