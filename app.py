@@ -79,7 +79,7 @@ class DataProcessor:
                     if k in col: clean_map[col] = v; break
         df.rename(columns=clean_map, inplace=True)
         
-        # [Fix] 強制轉換時間欄位為 datetime 物件，解決排序問題
+        # [Fix] 強制轉換時間欄位為 datetime 物件，解決排序與比對問題
         if 'Time' in df.columns:
             try:
                 df['Time'] = pd.to_datetime(df['Time'])
@@ -106,14 +106,30 @@ class StrategyEngine:
         self.processor = DataProcessor(None) # Helper
 
     def find_entry_info(self, entry_time_obj):
+        """
+        [Fix] 修正時間比對邏輯
+        使用 Hour 與 Minute 的數值比對，而非字串包含，避免 13:10 誤判為 10:00
+        """
         if entry_time_obj is None: return -1, 0.0
-        time_str = entry_time_obj.strftime("%H:%M")
-        mask = self.df['Time'].astype(str).str.contains(time_str, na=False)
-        matches = self.df[mask]
-        if not matches.empty:
-            idx = matches.index[-1] 
-            price = matches.loc[idx, 'Close']
-            return idx, price
+        
+        try:
+            # 確保 df['Time'] 是 datetime 格式
+            times = pd.to_datetime(self.df['Time'])
+            h = entry_time_obj.hour
+            m = entry_time_obj.minute
+            
+            # 精確篩選
+            mask = (times.dt.hour == h) & (times.dt.minute == m)
+            matches = self.df[mask]
+            
+            if not matches.empty:
+                # 若有多筆 (例如包含多天數據)，取最後一筆
+                idx = matches.index[-1] 
+                price = matches.loc[idx, 'Close']
+                return idx, price
+        except Exception as e:
+            st.error(f"時間比對發生錯誤: {e}")
+            
         return -1, 0.0
 
     def run_historical_review(self, user_pos_type, entry_time_obj):
@@ -248,7 +264,7 @@ class StrategyEngine:
                         status_str_exit = f"帳面{u_pnl:.0f}(出:{u_prob:.0%}/多:{prob_long:.0%}/空:{prob_short:.0%})"
                         
                         if u_prob > self.params['exit_threshold']:
-                            user_advice = "❌ 出場" # [Modify] 紅色叉叉 (多單出場)
+                            user_advice = "❌ 出場"
                             user_note = status_str_exit
                         else:
                             if prob_long > self.params['entry_threshold'] and prob_long > prob_short:
@@ -275,7 +291,7 @@ class StrategyEngine:
                         status_str_exit = f"帳面{u_pnl:.0f}(出:{u_prob:.0%}/多:{prob_long:.0%}/空:{prob_short:.0%})"
                         
                         if u_prob > self.params['exit_threshold']:
-                            user_advice = "❎ 出場" # [Modify] 綠色叉叉 (空單出場)
+                            user_advice = "❎ 出場"
                             user_note = status_str_exit
                         else:
                             if prob_short > self.params['entry_threshold'] and prob_short > prob_long:
@@ -439,7 +455,6 @@ with right_col:
             params = {'entry_threshold': entry_threshold, 'exit_threshold': exit_threshold, 'hard_stop': hard_stop}
             engine = StrategyEngine(df_clean, models, params)
             
-            # 執行回測與建議計算
             df_history = engine.run_historical_review(user_pos_type, user_entry_time)
             
             # --- A. 歷史訊號列表 (置頂) ---
@@ -453,7 +468,6 @@ with right_col:
                 use_container_width=True,
                 height=400,
                 column_config={
-                    # [Fix] 使用 DatetimeColumn 並設定格式為 HH:mm
                     "Time": st.column_config.DatetimeColumn("時間", format="HH:mm", width="small"),
                     "Close": st.column_config.NumberColumn("收盤價", format="%.0f", width="small"),
                     "Strategy_Action": st.column_config.TextColumn("模型策略", help="若 AI 全自動交易的操作", width="small"),
@@ -471,12 +485,10 @@ with right_col:
             df_chart = df_clean.tail(60).copy()
             df_hist_chart = df_history.tail(60).copy()
             
-            # [Fix] 轉換時間為 HH:mm 字串，確保圖表顯示簡潔
             df_chart['Time_Str'] = df_chart['Time'].dt.strftime('%H:%M')
             df_hist_chart['Time_Str'] = df_hist_chart['Time'].dt.strftime('%H:%M')
             
             fig = go.Figure()
-            # 使用 Time_Str 作為 X 軸
             fig.add_trace(go.Scatter(x=df_chart['Time_Str'], y=df_chart['Close'], mode='lines+markers', name='Price', line=dict(color='#1f77b4', width=2)))
             
             buys = df_hist_chart[df_hist_chart['Strategy_Action'].str.contains('買進')]
@@ -493,13 +505,10 @@ with right_col:
             if not exits_short.empty:
                 fig.add_trace(go.Scatter(x=exits_short['Time_Str'], y=exits_short['Close'], mode='markers', name='Exit Short', marker=dict(symbol='x', size=12, color='green'))) 
             
-            # [Added] 標記真實部位進場點
             real_entry_idx, _ = engine.find_entry_info(user_entry_time)
             
             if real_entry_idx != -1 and real_entry_idx in df_chart.index:
-                # 注意：這裡要從 df_chart 中取值，確保有 Time_Str
-                entry_time_str = df_chart.loc[real_entry_idx, 'Time_Str']
-                entry_close = df_chart.loc[real_entry_idx, 'Close']
+                entry_row = df_clean.loc[real_entry_idx]
                 
                 marker_symbol = 'star'
                 marker_color = 'red' if user_pos_type == "多單 (Long)" else 'green'
@@ -507,8 +516,8 @@ with right_col:
                 
                 if user_pos_type != "空手 (Empty)":
                     fig.add_trace(go.Scatter(
-                        x=[entry_time_str], 
-                        y=[entry_close], 
+                        x=[entry_row['Time'].strftime('%H:%M')], 
+                        y=[entry_row['Close']], 
                         mode='markers', 
                         name=marker_name, 
                         marker=dict(symbol=marker_symbol, size=20, color=marker_color, line=dict(width=2, color='white'))
