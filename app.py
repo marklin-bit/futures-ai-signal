@@ -97,21 +97,35 @@ class StrategyEngine:
         self.params = params
         self.processor = DataProcessor(None) # Helper
 
-    def run_historical_review(self, user_pos_type, user_cost, user_bars):
+    def find_entry_index(self, entry_time_str):
+        """尋找進場時間對應的 index"""
+        if not entry_time_str: return -1
+        # 簡單字串比對，只要包含即可 (例如 '09:00' in '2024/1/1 09:00')
+        matches = self.df[self.df['Time'].astype(str).str.contains(entry_time_str, na=False)]
+        if not matches.empty:
+            return matches.index[0]
+        return -1
+
+    def run_historical_review(self, user_pos_type, user_cost, entry_time_str):
         """
         同時計算：
         1. 策略模擬 (Auto Strategy): AI 自己玩會怎麼做 (空手開始)
-        2. 持單建議 (User Advice): 假設使用者在該時間點持有特定部位，AI 建議為何 (含加碼偵測)
+        2. 持單建議 (User Advice): 根據進場時間計算動態建議
         """
         # 策略模擬變數
         strat_pos = 0 
         strat_entry_price = 0.0
         strat_entry_index = 0
         
-        # 使用者設定映射
+        # 使用者設定
         pos_map = {"空手 (Empty)": "Empty", "多單 (Long)": "Long", "空單 (Short)": "Short"}
         u_pos = pos_map.get(user_pos_type, "Empty")
         
+        # 尋找使用者進場點
+        user_entry_idx = -1
+        if u_pos != "Empty":
+            user_entry_idx = self.find_entry_index(entry_time_str)
+
         history_records = []
         X_all = self.df[self.processor.feature_cols]
         
@@ -125,7 +139,6 @@ class StrategyEngine:
             prob_long = self.models['Long_Entry_Model'].predict_proba(current_features)[0][1]
             prob_short = self.models['Short_Entry_Model'].predict_proba(current_features)[0][1]
             
-            # 統一的趨勢字串
             trend_str = f"(多:{prob_long:.0%}/空:{prob_short:.0%})"
 
             # --- 1. 計算策略模擬 (Strategy Simulation) ---
@@ -188,62 +201,82 @@ class StrategyEngine:
                         strat_action = "續抱"
                         strat_detail = f"帳面 {pnl:.0f} {trend_str}"
 
-            # --- 2. 計算使用者持單建議 (含加碼偵測) ---
+            # --- 2. 計算使用者持單建議 (動態計算) ---
             user_advice = "-"
             user_note = ""
             
             if u_pos == "Empty":
-                # 修正: 空手時不顯示進場訊號，因為這是"持單建議"欄位
                 user_advice = "無持單"
                 user_note = "-"
             
-            elif u_pos == "Long":
-                u_pnl = current_close - user_cost
-                if u_pnl <= -self.params['hard_stop']:
-                    user_advice = "🛑 停損"
-                    user_note = f"{u_pnl:.0f}"
-                else:
-                    u_exit_feats = current_features.copy()
-                    u_exit_feats['Floating_PnL'] = u_pnl
-                    u_exit_feats['Hold_Bars'] = user_bars # 壓力測試值
-                    u_exit_feats = u_exit_feats[self.processor.exit_feature_cols]
-                    u_prob = self.models['Long_Exit_Model'].predict_proba(u_exit_feats)[0][1]
-                    
-                    if u_prob > self.params['exit_threshold']:
-                        user_advice = "🚀 出場"
-                        user_note = f"機率 {u_prob:.0%} {trend_str}"
-                    else:
-                        # 續抱狀態，檢查是否可加碼
-                        if prob_long > self.params['entry_threshold'] and prob_long > prob_short:
-                            user_advice = "🔥 加碼"
-                            user_note = f"加碼信 {prob_long:.0%} {trend_str}"
-                        else:
-                            user_advice = "⚓ 續抱"
-                            user_note = f"帳面 {u_pnl:.0f} {trend_str}"
+            elif user_entry_idx == -1:
+                # 找不到時間
+                user_advice = "時間未對上"
+                user_note = "檢查輸入"
 
-            elif u_pos == "Short":
-                u_pnl = user_cost - current_close
-                if u_pnl <= -self.params['hard_stop']:
-                    user_advice = "🛑 停損"
-                    user_note = f"{u_pnl:.0f}"
+            elif i < user_entry_idx:
+                # 時間未到
+                user_advice = "無訊號"
+                user_note = "-"
+            
+            elif i == user_entry_idx:
+                # 進場當下
+                if u_pos == "Long":
+                    user_advice = "🔵 多單進場" 
                 else:
-                    u_exit_feats = current_features.copy()
-                    u_exit_feats['Floating_PnL'] = u_pnl
-                    u_exit_feats['Hold_Bars'] = user_bars
-                    u_exit_feats = u_exit_feats[self.processor.exit_feature_cols]
-                    u_prob = self.models['Short_Exit_Model'].predict_proba(u_exit_feats)[0][1]
-                    
-                    if u_prob > self.params['exit_threshold']:
-                        user_advice = "🚀 出場"
-                        user_note = f"機率 {u_prob:.0%} {trend_str}"
+                    user_advice = "🟣 空單進場"
+                user_note = f"成本 {user_cost:.0f}"
+
+            else:
+                # 持倉中 (i > user_entry_idx)
+                # 自動計算 K 棒數
+                current_bars_held = i - user_entry_idx
+                
+                if u_pos == "Long":
+                    u_pnl = current_close - user_cost
+                    if u_pnl <= -self.params['hard_stop']:
+                        user_advice = "🛑 停損"
+                        user_note = f"{u_pnl:.0f}"
                     else:
-                        # 續抱狀態，檢查是否可加碼
-                        if prob_short > self.params['entry_threshold'] and prob_short > prob_long:
-                            user_advice = "🔥 加碼"
-                            user_note = f"加碼信 {prob_short:.0%} {trend_str}"
+                        u_exit_feats = current_features.copy()
+                        u_exit_feats['Floating_PnL'] = u_pnl
+                        u_exit_feats['Hold_Bars'] = current_bars_held
+                        u_exit_feats = u_exit_feats[self.processor.exit_feature_cols]
+                        u_prob = self.models['Long_Exit_Model'].predict_proba(u_exit_feats)[0][1]
+                        
+                        if u_prob > self.params['exit_threshold']:
+                            user_advice = "🚀 出場"
+                            user_note = f"機率 {u_prob:.0%} {trend_str}"
                         else:
-                            user_advice = "⚓ 續抱"
-                            user_note = f"帳面 {u_pnl:.0f} {trend_str}"
+                            if prob_long > self.params['entry_threshold'] and prob_long > prob_short:
+                                user_advice = "🔥 加碼"
+                                user_note = f"加碼信 {prob_long:.0%} {trend_str}"
+                            else:
+                                user_advice = "⚓ 續抱"
+                                user_note = f"帳面 {u_pnl:.0f} {trend_str}"
+
+                elif u_pos == "Short":
+                    u_pnl = user_cost - current_close
+                    if u_pnl <= -self.params['hard_stop']:
+                        user_advice = "🛑 停損"
+                        user_note = f"{u_pnl:.0f}"
+                    else:
+                        u_exit_feats = current_features.copy()
+                        u_exit_feats['Floating_PnL'] = u_pnl
+                        u_exit_feats['Hold_Bars'] = current_bars_held
+                        u_exit_feats = u_exit_feats[self.processor.exit_feature_cols]
+                        u_prob = self.models['Short_Exit_Model'].predict_proba(u_exit_feats)[0][1]
+                        
+                        if u_prob > self.params['exit_threshold']:
+                            user_advice = "🚀 出場"
+                            user_note = f"機率 {u_prob:.0%} {trend_str}"
+                        else:
+                            if prob_short > self.params['entry_threshold'] and prob_short > prob_long:
+                                user_advice = "🔥 加碼"
+                                user_note = f"加碼信 {prob_short:.0%} {trend_str}"
+                            else:
+                                user_advice = "⚓ 續抱"
+                                user_note = f"帳面 {u_pnl:.0f} {trend_str}"
 
             record = {
                 'Time': current_time,
@@ -257,14 +290,13 @@ class StrategyEngine:
             
         return pd.DataFrame(history_records)
 
-    def run_realtime_advice(self, user_position, entry_price, bars_held):
+    def run_realtime_advice(self, user_position, entry_price, entry_time_str):
         last_idx = len(self.df) - 1
         current_features = self.df.iloc[[last_idx]][DataProcessor(None).feature_cols].copy()
         current_close = self.df.iloc[last_idx].get('Close', 0)
         
         advice = {"Action": "Wait", "Confidence": 0.0, "PnL": 0.0, "Message": "資料不足", "Type": "Neutral"}
 
-        # 預先計算進場信心 (供加碼判斷用)
         prob_long = self.models['Long_Entry_Model'].predict_proba(current_features)[0][1]
         prob_short = self.models['Short_Entry_Model'].predict_proba(current_features)[0][1]
 
@@ -275,52 +307,60 @@ class StrategyEngine:
                 advice.update({"Action": "Sell", "Confidence": prob_short, "Message": "⚡ 空方訊號強勢，建議放空", "Type": "Sell"})
             else:
                 advice.update({"Action": "Wait", "Confidence": max(prob_long, prob_short), "Message": f"觀望 (多:{prob_long:.2f}/空:{prob_short:.2f})", "Type": "Wait"})
-
-        elif user_position == 'Long':
-            floating_pnl = current_close - entry_price
-            advice['PnL'] = floating_pnl
+        else:
+            # 尋找使用者進場點計算 K 棒數
+            user_entry_idx = self.find_entry_index(entry_time_str)
+            bars_held = 0
+            if user_entry_idx != -1 and last_idx >= user_entry_idx:
+                bars_held = last_idx - user_entry_idx
             
-            if floating_pnl <= -self.params['hard_stop']:
-                advice.update({"Action": "StopLoss", "Confidence": 1.0, "Message": f"🛑 觸發硬停損 (-{self.params['hard_stop']})", "Type": "Stop"})
-            else:
-                exit_feats = current_features.copy()
-                exit_feats['Floating_PnL'] = floating_pnl
-                exit_feats['Hold_Bars'] = bars_held
-                exit_feats = exit_feats[DataProcessor(None).exit_feature_cols]
-                
-                exit_prob = self.models['Long_Exit_Model'].predict_proba(exit_feats)[0][1]
-                
-                if exit_prob > self.params['exit_threshold']:
-                    advice.update({"Action": "Exit", "Confidence": exit_prob, "Message": f"🚀 AI 建議多單出場 (機率 {exit_prob:.0%})", "Type": "Exit"})
-                else:
-                    # 檢查加碼
-                    if prob_long > self.params['entry_threshold'] and prob_long > prob_short:
-                        advice.update({"Action": "Hold+", "Confidence": prob_long, "Message": "⚓ 續抱且出現多方訊號 (🔥可加碼)", "Type": "Buy"})
-                    else:
-                        advice.update({"Action": "Hold", "Confidence": 1-exit_prob, "Message": f"⚓ AI 建議續抱 (出場率 {exit_prob:.0%})", "Type": "Hold"})
+            # 如果時間還沒到或找不到，可能導致 Hold Bars = 0，Exit Model 可能會誤判
+            # 這裡做一個簡單防呆
+            if bars_held < 0: bars_held = 0
 
-        elif user_position == 'Short':
-            floating_pnl = entry_price - current_close
-            advice['PnL'] = floating_pnl
-            
-            if floating_pnl <= -self.params['hard_stop']:
-                advice.update({"Action": "StopLoss", "Confidence": 1.0, "Message": f"🛑 觸發硬停損 (-{self.params['hard_stop']})", "Type": "Stop"})
-            else:
-                exit_feats = current_features.copy()
-                exit_feats['Floating_PnL'] = floating_pnl
-                exit_feats['Hold_Bars'] = bars_held
-                exit_feats = exit_feats[DataProcessor(None).exit_feature_cols]
+            if user_position == 'Long':
+                floating_pnl = current_close - entry_price
+                advice['PnL'] = floating_pnl
                 
-                exit_prob = self.models['Short_Exit_Model'].predict_proba(exit_feats)[0][1]
-                
-                if exit_prob > self.params['exit_threshold']:
-                    advice.update({"Action": "Exit", "Confidence": exit_prob, "Message": f"🚀 AI 建議空單出場 (機率 {exit_prob:.0%})", "Type": "Exit"})
+                if floating_pnl <= -self.params['hard_stop']:
+                    advice.update({"Action": "StopLoss", "Confidence": 1.0, "Message": f"🛑 觸發硬停損 (-{self.params['hard_stop']})", "Type": "Stop"})
                 else:
-                    # 檢查加碼
-                    if prob_short > self.params['entry_threshold'] and prob_short > prob_long:
-                        advice.update({"Action": "Hold+", "Confidence": prob_short, "Message": "⚓ 續抱且出現空方訊號 (🔥可加碼)", "Type": "Sell"})
+                    exit_feats = current_features.copy()
+                    exit_feats['Floating_PnL'] = floating_pnl
+                    exit_feats['Hold_Bars'] = bars_held
+                    exit_feats = exit_feats[DataProcessor(None).exit_feature_cols]
+                    
+                    exit_prob = self.models['Long_Exit_Model'].predict_proba(exit_feats)[0][1]
+                    
+                    if exit_prob > self.params['exit_threshold']:
+                        advice.update({"Action": "Exit", "Confidence": exit_prob, "Message": f"🚀 AI 建議多單出場 (機率 {exit_prob:.0%})", "Type": "Exit"})
                     else:
-                        advice.update({"Action": "Hold", "Confidence": 1-exit_prob, "Message": f"⚓ AI 建議續抱 (出場率 {exit_prob:.0%})", "Type": "Hold"})
+                        if prob_long > self.params['entry_threshold'] and prob_long > prob_short:
+                            advice.update({"Action": "Hold+", "Confidence": prob_long, "Message": "⚓ 續抱且出現多方訊號 (🔥可加碼)", "Type": "Buy"})
+                        else:
+                            advice.update({"Action": "Hold", "Confidence": 1-exit_prob, "Message": f"⚓ AI 建議續抱 (出場率 {exit_prob:.0%})", "Type": "Hold"})
+
+            elif user_position == 'Short':
+                floating_pnl = entry_price - current_close
+                advice['PnL'] = floating_pnl
+                
+                if floating_pnl <= -self.params['hard_stop']:
+                    advice.update({"Action": "StopLoss", "Confidence": 1.0, "Message": f"🛑 觸發硬停損 (-{self.params['hard_stop']})", "Type": "Stop"})
+                else:
+                    exit_feats = current_features.copy()
+                    exit_feats['Floating_PnL'] = floating_pnl
+                    exit_feats['Hold_Bars'] = bars_held
+                    exit_feats = exit_feats[DataProcessor(None).exit_feature_cols]
+                    
+                    exit_prob = self.models['Short_Exit_Model'].predict_proba(exit_feats)[0][1]
+                    
+                    if exit_prob > self.params['exit_threshold']:
+                        advice.update({"Action": "Exit", "Confidence": exit_prob, "Message": f"🚀 AI 建議空單出場 (機率 {exit_prob:.0%})", "Type": "Exit"})
+                    else:
+                        if prob_short > self.params['entry_threshold'] and prob_short > prob_long:
+                            advice.update({"Action": "Hold+", "Confidence": prob_short, "Message": "⚓ 續抱且出現空方訊號 (🔥可加碼)", "Type": "Sell"})
+                        else:
+                            advice.update({"Action": "Hold", "Confidence": 1-exit_prob, "Message": f"⚓ AI 建議續抱 (出場率 {exit_prob:.0%})", "Type": "Hold"})
 
         return advice
 
@@ -360,11 +400,12 @@ with left_col:
     st.caption("設定後，右側表格將顯示針對此部位的歷史建議")
     user_pos_type = st.radio("持倉狀態", ["空手 (Empty)", "多單 (Long)", "空單 (Short)"], label_visibility="collapsed")
     user_entry_price = 0.0
-    user_bars_held = 0
+    user_entry_time = "09:00"
+    
     if user_pos_type != "空手 (Empty)":
         c1, c2 = st.columns(2)
         user_entry_price = c1.number_input("成本", value=17500.0, step=1.0)
-        user_bars_held = c2.number_input("K棒數", value=1, step=1, min_value=1)
+        user_entry_time = c2.text_input("買進時間", value="09:00", help="請輸入與資料相符的時間格式 (如 09:00)")
 
     st.markdown("---")
     tab1, tab2 = st.tabs(["📝 貼上資料", "🔄 即時串接"])
@@ -396,12 +437,34 @@ with right_col:
             engine = StrategyEngine(df_clean, models, params)
             
             # 執行回測與建議計算
-            df_history = engine.run_historical_review(user_pos_type, user_entry_price, user_bars_held)
+            df_history = engine.run_historical_review(user_pos_type, user_entry_price, user_entry_time)
+            
+            # 取得即時建議 (根據最後一筆資料)
+            # 注意: run_realtime_advice 也需要知道 hold_bars，現在會透過時間自動算
+            advice = engine.run_realtime_advice(
+                {"空手 (Empty)": "Empty", "多單 (Long)": "Long", "空單 (Short)": "Short"}[user_pos_type], 
+                user_entry_price, 
+                user_entry_time
+            )
+
+            # --- Dashboard ---
+            st.markdown("---")
+            last_row = df_clean.iloc[-1]
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("📊 最新時間", str(last_row.get('Time', 'N/A'))[-5:]) 
+            m2.metric("💰 收盤價", f"{last_row.get('Close', 0):.0f}")
+            
+            delta_color = "off"
+            if advice['Type'] in ['Buy', 'Exit']: delta_color = "normal"
+            elif advice['Type'] in ['Sell', 'Stop']: delta_color = "inverse"
+            m3.metric("🤖 AI 決策", advice['Type'], delta=advice['Message'], delta_color=delta_color)
+            
+            pnl_show = f"{advice['PnL']:.0f}" if user_pos_type != "空手 (Empty)" else "-"
+            m4.metric("🎯 信心/損益", f"{advice['Confidence']:.0%}", delta=pnl_show)
 
             # --- A. 歷史訊號列表 (置頂) ---
             st.subheader("📜 歷史訊號回放")
             
-            # 排序控制
             c_sort, _ = st.columns([1, 2])
             sort_order = c_sort.radio("排序方式", ["時間：新 → 舊 (倒序)", "時間：舊 → 新 (正序)"], horizontal=True, label_visibility="collapsed")
             
@@ -409,7 +472,6 @@ with right_col:
             if "新 → 舊" in sort_order:
                 df_show = df_show.iloc[::-1] # 倒序
             
-            # 使用 column_config 優化顯示
             st.dataframe(
                 df_show,
                 use_container_width=True,
@@ -430,13 +492,11 @@ with right_col:
             st.subheader("📊 近 60 根 K 棒走勢")
             
             df_chart = df_clean.tail(60)
-            # 為了標記，我們需要對應的歷史紀錄
             df_hist_chart = df_history.tail(60)
             
             fig = go.Figure()
             fig.add_trace(go.Scatter(x=df_chart['Time'], y=df_chart['Close'], mode='lines+markers', name='Price', line=dict(color='#1f77b4', width=2)))
             
-            # 標記自動策略的買賣點
             buys = df_hist_chart[df_hist_chart['Strategy_Action'].str.contains('買進')]
             sells = df_hist_chart[df_hist_chart['Strategy_Action'].str.contains('放空')]
             exits = df_hist_chart[df_hist_chart['Strategy_Action'].str.contains('出場')]
