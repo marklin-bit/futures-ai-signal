@@ -108,7 +108,6 @@ class StrategyEngine:
         time_str = entry_time_obj.strftime("%H:%M")
         
         # 在 df['Time'] 中尋找包含此時間字串的列
-        # 假設是 intraday，我們找最後一個符合的時間點 (以免抓到舊日期的)
         mask = self.df['Time'].astype(str).str.contains(time_str, na=False)
         matches = self.df[mask]
         
@@ -248,18 +247,21 @@ class StrategyEngine:
                         u_exit_feats['Hold_Bars'] = current_bars_held
                         u_exit_feats = u_exit_feats[self.processor.exit_feature_cols]
                         u_prob = self.models['Long_Exit_Model'].predict_proba(u_exit_feats)[0][1]
+                        hold_conf = 1.0 - u_prob
+                        
+                        # 統一格式: 帳面XX(續:X%/多:X%/空:X%)
+                        status_str = f"帳面{u_pnl:.0f}(續:{hold_conf:.0%}/多:{prob_long:.0%}/空:{prob_short:.0%})"
                         
                         if u_prob > self.params['exit_threshold']:
                             user_advice = "🚀 出場"
                             user_note = f"出場率 {u_prob:.0%} {trend_str}"
                         else:
-                            hold_conf = 1.0 - u_prob # 續抱信心
                             if prob_long > self.params['entry_threshold'] and prob_long > prob_short:
                                 user_advice = "🔥 加碼"
-                                user_note = f"加碼信 {prob_long:.0%} {trend_str}"
+                                user_note = status_str
                             else:
                                 user_advice = "⚓ 續抱"
-                                user_note = f"續抱信 {hold_conf:.0%} {trend_str}"
+                                user_note = status_str
 
                 elif u_pos == "Short":
                     u_pnl = user_cost - current_close
@@ -272,18 +274,21 @@ class StrategyEngine:
                         u_exit_feats['Hold_Bars'] = current_bars_held
                         u_exit_feats = u_exit_feats[self.processor.exit_feature_cols]
                         u_prob = self.models['Short_Exit_Model'].predict_proba(u_exit_feats)[0][1]
+                        hold_conf = 1.0 - u_prob
+                        
+                        # 統一格式: 帳面XX(續:X%/多:X%/空:X%)
+                        status_str = f"帳面{u_pnl:.0f}(續:{hold_conf:.0%}/多:{prob_long:.0%}/空:{prob_short:.0%})"
                         
                         if u_prob > self.params['exit_threshold']:
                             user_advice = "🚀 出場"
                             user_note = f"出場率 {u_prob:.0%} {trend_str}"
                         else:
-                            hold_conf = 1.0 - u_prob
                             if prob_short > self.params['entry_threshold'] and prob_short > prob_long:
                                 user_advice = "🔥 加碼"
-                                user_note = f"加碼信 {prob_short:.0%} {trend_str}"
+                                user_note = status_str
                             else:
                                 user_advice = "⚓ 續抱"
-                                user_note = f"續抱信 {hold_conf:.0%} {trend_str}"
+                                user_note = status_str
 
             record = {
                 'Time': current_time,
@@ -454,18 +459,18 @@ with right_col:
             st.markdown("---")
             last_row = df_clean.iloc[-1]
             
-            # 調整為 3 欄
-            m1, m3, m4 = st.columns([1, 1.5, 1.5])
+            # [Modify] 移除收盤價，改為 3 欄
+            m1, m2, m3 = st.columns([1, 1.5, 1.5])
             m1.metric("📊 最新時間", str(last_row.get('Time', 'N/A'))[-5:]) 
             
             delta_color = "off"
             if advice['Type'] in ['Buy', 'Exit']: delta_color = "normal"
             elif advice['Type'] in ['Sell', 'Stop']: delta_color = "inverse"
-            m3.metric("🤖 AI 決策", advice['Type'], delta=advice['Message'], delta_color=delta_color)
+            m2.metric("🤖 AI 決策", advice['Type'], delta=advice['Message'], delta_color=delta_color)
             
             pnl_show = f"{advice['PnL']:.0f}" if user_pos_type != "空手 (Empty)" else "-"
             # 這裡顯示的是動態 Label (例如: 續抱信心/出場機率)
-            m4.metric(f"🎯 {advice['Label']}/損益", f"{advice['Confidence']:.0%}", delta=pnl_show)
+            m3.metric(f"🎯 {advice['Label']}/損益", f"{advice['Confidence']:.0%}", delta=pnl_show)
 
             # --- A. 歷史訊號列表 (置頂) ---
             st.subheader("📜 歷史訊號回放")
