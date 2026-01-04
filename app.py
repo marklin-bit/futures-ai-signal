@@ -7,23 +7,33 @@ import plotly.graph_objects as go
 import os
 import io
 
-# 設定網頁標題與寬度
-st.set_page_config(page_title="台指期 AI 交易訊號站", layout="wide")
+# 1. 網頁設定 (直接設定視窗標題，隱藏頁面內的大標題)
+st.set_page_config(page_title="AI 交易訊號戰情室", layout="wide", initial_sidebar_state="expanded")
+
+# CSS 美化 (縮減頂部空白，讓儀表板更緊湊)
+st.markdown("""
+    <style>
+        .block-container {
+            padding-top: 1rem;
+            padding-bottom: 1rem;
+        }
+        div[data-testid="stMetricValue"] {
+            font-size: 24px;
+        }
+    </style>
+""", unsafe_allow_html=True)
 
 # ==========================================
-# 1. 核心類別定義
+# 2. 核心類別定義
 # ==========================================
 class DataProcessor:
     def __init__(self, df):
         self.raw_df = df
-        # 定義特徵欄位 (必須與訓練時完全一樣)
         self.feature_cols = [
             'Bandwidth', 'MA_Slope', 'Bandwidth_Rate', 'Rel_Volume',
             'K', 'D', 'Position_in_Channel', 'Volatility', 
             'K_Strength', 'Body_Ratio', 'Week', 'Settlement_Day', 'Time_Segment'
         ]
-        # 定義中文對照 (方便使用者上傳原始檔)
-        # 鍵值(Key)是使用者Excel可能的欄位名，值(Value)是程式內部用的英文名
         self.rename_map = {
             '布林通道寬度': 'Bandwidth', 'MA斜率\n0平/1上/-1下': 'MA_Slope', 'MA斜率': 'MA_Slope',
             '布林帶寬度變化率': 'Bandwidth_Rate', '相對成交量': 'Rel_Volume',
@@ -39,42 +49,73 @@ class DataProcessor:
         }
         self.exit_feature_cols = self.feature_cols + ['Floating_PnL', 'Hold_Bars']
 
+    def validate_time_continuity(self, df):
+        """
+        [防呆機制] 檢查時間是否為連續的 5 分鐘
+        """
+        if 'Time' not in df.columns:
+            return [], "找不到時間欄位，無法檢查連續性。"
+        
+        try:
+            # 嘗試轉換時間格式
+            time_series = pd.to_datetime(df['Time'])
+            # 計算時間差
+            diffs = time_series.diff()
+            
+            # 找出間隔不等於 5 分鐘的列 (排除第一筆 NaN)
+            # 5分鐘 = 300秒
+            # 容許跨日 (例如 13:45 -> 隔日 08:45)，但盤中必須連續
+            # 這裡做嚴格檢查：只要不是 5 分鐘就警示，使用者自行判斷是否為跨日
+            discontinuous_indices = []
+            
+            for i in range(1, len(diffs)):
+                delta = diffs.iloc[i]
+                if delta.total_seconds() != 300: # 300秒 = 5分鐘
+                    curr_time = time_series.iloc[i]
+                    prev_time = time_series.iloc[i-1]
+                    discontinuous_indices.append(f"{prev_time.strftime('%H:%M')} -> {curr_time.strftime('%H:%M')} (間隔 {delta})")
+            
+            return discontinuous_indices, None
+            
+        except Exception as e:
+            return [], f"時間格式解析失敗: {e}"
+
     def process(self):
         if self.raw_df is None or self.raw_df.empty:
-            return pd.DataFrame(), []
+            return pd.DataFrame(), [], []
 
         df = self.raw_df.copy()
-        
-        # 1. 欄位更名
-        # 先轉字串處理換行
         df.columns = df.columns.astype(str)
         df.rename(columns=lambda x: x.replace('\n', '').strip(), inplace=True)
         
         clean_map = {}
         for col in df.columns:
-            # 嘗試完全比對
             if col in self.rename_map:
                 clean_map[col] = self.rename_map[col]
             else:
-                # 嘗試部分比對 (例如 "MA斜率" in "MA斜率\n0平...")
                 for k, v in self.rename_map.items():
                     if k in col:
                         clean_map[col] = v
                         break
         df.rename(columns=clean_map, inplace=True)
         
-        # 2. 檢查是否有缺漏的關鍵欄位
+        # 欄位檢查
         missing_features = []
         for col in self.feature_cols:
             if col not in df.columns:
                 missing_features.append(col)
-                df[col] = 0 # 暫時補0防崩潰，但會回傳缺失清單
+                df[col] = 0 
             else:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
         
+        # 時間連續性檢查
+        discontinuities = []
+        if 'Time' in df.columns:
+            discontinuities, err = self.validate_time_continuity(df)
+        
         df.fillna(0, inplace=True)
         df.reset_index(drop=True, inplace=True)
-        return df, missing_features
+        return df, missing_features, discontinuities
 
 class StrategyEngine:
     def __init__(self, df, models, params):
@@ -83,9 +124,6 @@ class StrategyEngine:
         self.params = params
 
     def run_historical_review(self):
-        """
-        模擬從第一筆資料開始跑到最後一筆 (歷史回放)
-        """
         position = 0 
         entry_price = 0.0
         entry_index = 0
@@ -108,7 +146,6 @@ class StrategyEngine:
                 'Detail': ''
             }
 
-            # 模擬策略
             if position == 0:
                 prob_long = self.models['Long_Entry_Model'].predict_proba(current_features)[0][1]
                 prob_short = self.models['Short_Entry_Model'].predict_proba(current_features)[0][1]
@@ -119,24 +156,23 @@ class StrategyEngine:
                     entry_index = i
                     record['Suggestion'] = '🔥 買進'
                     record['Confidence'] = prob_long
-                    record['Detail'] = f"做多信心 {prob_long:.0%}"
-                
+                    record['Detail'] = f"做多 {prob_long:.0%}"
                 elif prob_short > self.params['entry_threshold'] and prob_short > prob_long:
                     position = -1
                     entry_price = current_close
                     entry_index = i
                     record['Suggestion'] = '⚡ 放空'
                     record['Confidence'] = prob_short
-                    record['Detail'] = f"做空信心 {prob_short:.0%}"
+                    record['Detail'] = f"做空 {prob_short:.0%}"
                 else:
-                    record['Detail'] = f"多:{prob_long:.2f} / 空:{prob_short:.2f}"
+                    record['Detail'] = f"多:{prob_long:.2f}/空:{prob_short:.2f}"
 
-            elif position == 1: # 模擬持多
+            elif position == 1:
                 floating_pnl = current_close - entry_price
                 if floating_pnl <= -self.params['hard_stop']:
                     position = 0
-                    record['Suggestion'] = '🛑 停損出場'
-                    record['Detail'] = f"虧損 {floating_pnl} 點"
+                    record['Suggestion'] = '🛑 停損'
+                    record['Detail'] = f"損 {floating_pnl}"
                 else:
                     exit_feats = current_features.copy()
                     exit_feats['Floating_PnL'] = floating_pnl
@@ -146,19 +182,19 @@ class StrategyEngine:
                     exit_prob = self.models['Long_Exit_Model'].predict_proba(exit_feats)[0][1]
                     if exit_prob > self.params['exit_threshold']:
                         position = 0
-                        record['Suggestion'] = '🟢 多單出場'
+                        record['Suggestion'] = '🟢 出場'
                         record['Confidence'] = exit_prob
-                        record['Detail'] = f"出場機率 {exit_prob:.0%}"
+                        record['Detail'] = f"率 {exit_prob:.0%}"
                     else:
-                        record['Suggestion'] = '持多續抱'
-                        record['Detail'] = f"帳面 {floating_pnl} 點"
+                        record['Suggestion'] = '續抱'
+                        record['Detail'] = f"帳 {floating_pnl}"
 
-            elif position == -1: # 模擬持空
+            elif position == -1:
                 floating_pnl = entry_price - current_close
                 if floating_pnl <= -self.params['hard_stop']:
                     position = 0
-                    record['Suggestion'] = '🛑 停損出場'
-                    record['Detail'] = f"虧損 {floating_pnl} 點"
+                    record['Suggestion'] = '🛑 停損'
+                    record['Detail'] = f"損 {floating_pnl}"
                 else:
                     exit_feats = current_features.copy()
                     exit_feats['Floating_PnL'] = floating_pnl
@@ -168,63 +204,42 @@ class StrategyEngine:
                     exit_prob = self.models['Short_Exit_Model'].predict_proba(exit_feats)[0][1]
                     if exit_prob > self.params['exit_threshold']:
                         position = 0
-                        record['Suggestion'] = '🔴 空單出場'
+                        record['Suggestion'] = '🔴 出場'
                         record['Confidence'] = exit_prob
-                        record['Detail'] = f"出場機率 {exit_prob:.0%}"
+                        record['Detail'] = f"率 {exit_prob:.0%}"
                     else:
-                        record['Suggestion'] = '持空續抱'
-                        record['Detail'] = f"帳面 {floating_pnl} 點"
+                        record['Suggestion'] = '續抱'
+                        record['Detail'] = f"帳 {floating_pnl}"
             
             history_records.append(record)
             
         return pd.DataFrame(history_records)
 
     def run_realtime_advice(self, user_position, entry_price, bars_held):
-        """
-        針對「最後一筆資料」，結合「使用者真實部位」給出建議
-        """
-        # 取最後一筆
         last_idx = len(self.df) - 1
         current_features = self.df.iloc[[last_idx]][DataProcessor(None).feature_cols].copy()
         current_close = self.df.iloc[last_idx].get('Close', 0)
         
-        advice = {
-            "Action": "Wait",
-            "Confidence": 0.0,
-            "PnL": 0.0,
-            "Message": "資料不足"
-        }
+        advice = {"Action": "Wait", "Confidence": 0.0, "PnL": 0.0, "Message": "資料不足", "Type": "Neutral"}
 
-        # 1. 如果使用者是空手 (Empty) -> 跑進場模型
         if user_position == 'Empty':
             prob_long = self.models['Long_Entry_Model'].predict_proba(current_features)[0][1]
             prob_short = self.models['Short_Entry_Model'].predict_proba(current_features)[0][1]
             
             if prob_long > self.params['entry_threshold'] and prob_long > prob_short:
-                advice['Action'] = "Buy"
-                advice['Confidence'] = prob_long
-                advice['Message'] = "多方訊號強勢，建議買進"
+                advice.update({"Action": "Buy", "Confidence": prob_long, "Message": "🔥 多方訊號強勢，建議買進", "Type": "Buy"})
             elif prob_short > self.params['entry_threshold'] and prob_short > prob_long:
-                advice['Action'] = "Sell"
-                advice['Confidence'] = prob_short
-                advice['Message'] = "空方訊號強勢，建議放空"
+                advice.update({"Action": "Sell", "Confidence": prob_short, "Message": "⚡ 空方訊號強勢，建議放空", "Type": "Sell"})
             else:
-                advice['Action'] = "Wait"
-                advice['Confidence'] = max(prob_long, prob_short)
-                advice['Message'] = f"訊號不明確 (多:{prob_long:.2f} / 空:{prob_short:.2f})"
+                advice.update({"Action": "Wait", "Confidence": max(prob_long, prob_short), "Message": f"觀望 (多:{prob_long:.2f}/空:{prob_short:.2f})", "Type": "Wait"})
 
-        # 2. 如果使用者持有多單 (Long) -> 跑多單出場模型
         elif user_position == 'Long':
             floating_pnl = current_close - entry_price
             advice['PnL'] = floating_pnl
             
-            # 硬停損檢查
             if floating_pnl <= -self.params['hard_stop']:
-                advice['Action'] = "StopLoss"
-                advice['Confidence'] = 1.0
-                advice['Message'] = f"觸發硬停損 (-{self.params['hard_stop']}點)，請立即出場"
+                advice.update({"Action": "StopLoss", "Confidence": 1.0, "Message": f"🛑 觸發硬停損 (-{self.params['hard_stop']})", "Type": "Stop"})
             else:
-                # 準備特徵
                 exit_feats = current_features.copy()
                 exit_feats['Floating_PnL'] = floating_pnl
                 exit_feats['Hold_Bars'] = bars_held
@@ -234,21 +249,16 @@ class StrategyEngine:
                 advice['Confidence'] = exit_prob
                 
                 if exit_prob > self.params['exit_threshold']:
-                    advice['Action'] = "Exit"
-                    advice['Message'] = f"AI 建議多單出場 (機率 {exit_prob:.0%})"
+                    advice.update({"Action": "Exit", "Message": f"🚀 AI 建議多單出場 (機率 {exit_prob:.0%})", "Type": "Exit"})
                 else:
-                    advice['Action'] = "Hold"
-                    advice['Message'] = f"AI 建議續抱 (出場率僅 {exit_prob:.0%})"
+                    advice.update({"Action": "Hold", "Message": f"⚓ AI 建議續抱 (出場率 {exit_prob:.0%})", "Type": "Hold"})
 
-        # 3. 如果使用者持有空單 (Short) -> 跑空單出場模型
         elif user_position == 'Short':
             floating_pnl = entry_price - current_close
             advice['PnL'] = floating_pnl
             
             if floating_pnl <= -self.params['hard_stop']:
-                advice['Action'] = "StopLoss"
-                advice['Confidence'] = 1.0
-                advice['Message'] = f"觸發硬停損 (-{self.params['hard_stop']}點)，請立即出場"
+                advice.update({"Action": "StopLoss", "Confidence": 1.0, "Message": f"🛑 觸發硬停損 (-{self.params['hard_stop']})", "Type": "Stop"})
             else:
                 exit_feats = current_features.copy()
                 exit_feats['Floating_PnL'] = floating_pnl
@@ -259,16 +269,14 @@ class StrategyEngine:
                 advice['Confidence'] = exit_prob
                 
                 if exit_prob > self.params['exit_threshold']:
-                    advice['Action'] = "Exit"
-                    advice['Message'] = f"AI 建議空單出場 (機率 {exit_prob:.0%})"
+                    advice.update({"Action": "Exit", "Message": f"🚀 AI 建議空單出場 (機率 {exit_prob:.0%})", "Type": "Exit"})
                 else:
-                    advice['Action'] = "Hold"
-                    advice['Message'] = f"AI 建議續抱 (出場率僅 {exit_prob:.0%})"
+                    advice.update({"Action": "Hold", "Message": f"⚓ AI 建議續抱 (出場率 {exit_prob:.0%})", "Type": "Hold"})
 
         return advice
 
 # ==========================================
-# 2. 載入模型
+# 3. 載入模型
 # ==========================================
 @st.cache_resource
 def load_models():
@@ -280,112 +288,164 @@ def load_models():
         for path in paths_to_try:
             file_path = f"{path}{name}.pkl"
             if os.path.exists(file_path):
-                try:
-                    model = joblib.load(file_path)
-                    break
+                try: model = joblib.load(file_path); break
                 except: pass
         if model: loaded_models[name] = model
         else: return None
     return loaded_models
 
 # ==========================================
-# 3. 網頁介面主邏輯
+# 4. 網頁介面主邏輯 (儀表板佈局)
 # ==========================================
-st.title("🚀 台指期 5分K 四模型即時訊號站")
 
-# --- 側邊欄設定 ---
-st.sidebar.header("⚙️ 策略參數")
-entry_threshold = st.sidebar.slider("進場信心門檻", 0.5, 0.95, 0.80, 0.05)
-exit_threshold = st.sidebar.slider("出場機率門檻", 0.3, 0.9, 0.50, 0.05)
-hard_stop = st.sidebar.number_input("硬停損點數", value=100, step=10)
+# 建立兩欄佈局：左側輸入(30%)，右側儀表板(70%)
+left_col, right_col = st.columns([1, 2.5])
 
-st.sidebar.markdown("---")
-st.sidebar.header("👤 實戰部位設定")
-st.sidebar.info("請在此輸入您目前的真實部位，AI 才能提供正確的出場建議。")
-user_pos_type = st.sidebar.radio("目前持倉狀態", ["空手 (Empty)", "多單 (Long)", "空單 (Short)"])
-
-user_entry_price = 0.0
-user_bars_held = 0
-
-if user_pos_type != "空手 (Empty)":
-    user_entry_price = st.sidebar.number_input("進場成本價", value=17500.0, step=1.0)
-    user_bars_held = st.sidebar.number_input("已持有 K 棒數", value=1, step=1, min_value=1)
-
-# 載入模型
 models = load_models()
-if models is None:
-    st.error("⚠️ 找不到模型檔案 (.pkl)。")
-    st.stop()
 
-# --- 資料輸入區塊 ---
-st.subheader("📋 資料輸入")
-st.info("💡 提示：Excel 複製時，請務必包含以下「關鍵欄位標題」(順序不拘)：\n"
-        "收盤時間, 收盤價, K值, D值, 布林通道寬度, MA斜率, "
-        "相對成交量, 通道位置, 波動率, K棒強度, 實體佔比, 星期, 結算日, 時段")
-
-tab1, tab2 = st.tabs(["📝 貼上 Excel 資料", "📂 上傳 CSV 檔案"])
-
-df_input = None
-with tab1:
-    st.caption("請從 Excel 複製資料 (含標題) 貼上。")
-    paste_data = st.text_area("貼上區 (Ctrl+V):", height=150)
-    if paste_data:
-        try:
-            df_input = pd.read_csv(io.StringIO(paste_data), sep='\t')
-        except: st.error("資料解析失敗")
-
-with tab2:
-    uploaded_file = st.file_uploader("上傳 CSV", type=['csv'])
-    if uploaded_file:
-        try:
-            df_input = pd.read_csv(uploaded_file)
-        except: st.error("讀取失敗")
-
-# --- 執行分析 ---
-if df_input is not None and not df_input.empty:
-    processor = DataProcessor(df_input)
-    # process 現在會回傳兩個值：資料表 和 缺失欄位清單
-    df_clean, missing_cols = processor.process()
+# --- 左側欄位：控制與輸入 ---
+with left_col:
+    st.subheader("🛠️ 數據與參數")
     
-    # 檢查是否有缺失欄位，並發出警告
-    if missing_cols:
-        st.error(f"❌ 嚴重警告：偵測到資料缺少以下關鍵欄位，模型將無法正確運作！\n"
-                 f"缺失欄位: {missing_cols}")
-        st.stop() # 強制停止，避免算出錯誤數據
-    
-    params = {'entry_threshold': entry_threshold, 'exit_threshold': exit_threshold, 'hard_stop': hard_stop}
-    engine = StrategyEngine(df_clean, models, params)
+    # 參數設定區
+    with st.expander("⚙️ 策略參數設定", expanded=False):
+        entry_threshold = st.slider("進場信心", 0.5, 0.95, 0.80, 0.05)
+        exit_threshold = st.slider("出場機率", 0.3, 0.9, 0.50, 0.05)
+        hard_stop = st.number_input("硬停損點數", value=100, step=10)
 
-    # 1. 取得即時建議
-    pos_map = {"空手 (Empty)": "Empty", "多單 (Long)": "Long", "空單 (Short)": "Short"}
-    realtime_advice = engine.run_realtime_advice(pos_map[user_pos_type], user_entry_price, user_bars_held)
+    # 部位設定區
+    st.markdown("##### 👤 目前真實部位")
+    user_pos_type = st.radio("持倉狀態", ["空手 (Empty)", "多單 (Long)", "空單 (Short)"], label_visibility="collapsed")
+    user_entry_price = 0.0
+    user_bars_held = 0
+    if user_pos_type != "空手 (Empty)":
+        c1, c2 = st.columns(2)
+        user_entry_price = c1.number_input("成本", value=17500.0, step=1.0)
+        user_bars_held = c2.number_input("K棒數", value=1, step=1, min_value=1)
 
-    # 2. 取得歷史回放
-    df_history = engine.run_historical_review()
-
-    # --- Dashboard 顯示 ---
     st.markdown("---")
-    last_row = df_clean.iloc[-1]
     
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("最新時間", str(last_row.get('Time', 'N/A')))
-    col2.metric("收盤價", f"{last_row.get('Close', 0):.0f}")
+    # 資料輸入區 (Tabs)
+    tab1, tab2 = st.tabs(["📝 貼上資料", "🔄 即時串接"])
     
-    # AI 建議燈號
-    advice_color = "off"
-    if realtime_advice['Action'] in ['Buy', 'Exit', 'StopLoss']: advice_color = "inverse"
+    df_input = None
+    with tab1:
+        st.caption("請從 Excel 複製含標題的數據 (時間, 收盤價, K, D, 布林, MA斜率...)")
+        paste_data = st.text_area("Ctrl+V 貼上區", height=250, label_visibility="collapsed")
+        if paste_data:
+            try:
+                df_input = pd.read_csv(io.StringIO(paste_data), sep='\t')
+            except: st.error("格式錯誤")
     
-    col3.metric("AI 實戰建議", realtime_advice['Message'])
-    col4.metric("信心/機率", f"{realtime_advice['Confidence']:.1%}", delta=f"損益: {realtime_advice['PnL']:.0f}" if user_pos_type != "空手 (Empty)" else None)
+    with tab2:
+        st.info("🚧 此功能開發中\n\n未來將透過 API 自動抓取報價，實現全自動訊號推播。")
 
-    # --- 歷史建議清單 ---
-    st.subheader("📜 歷史訊號回放列表")
-    st.caption("以下列表展示：如果 AI 從第一筆資料就開始看盤，它會在每個時間點給出什麼建議？(這能幫您補回錯過的行情判斷)")
+# --- 右側欄位：戰情儀表板 ---
+with right_col:
+    if models is None:
+        st.error("⚠️ 模型載入失敗，請檢查 GitHub 檔案。")
     
-    # 整理表格顯示
-    display_cols = ['Time', 'Close', 'Suggestion', 'Detail']
-    # 把最新的排在最上面
-    st.dataframe(df_history[display_cols].iloc[::-1], use_container_width=True)
+    elif df_input is not None and not df_input.empty:
+        processor = DataProcessor(df_input)
+        df_clean, missing_cols, discontinuities = processor.process()
+        
+        # 1. 錯誤檢查
+        if missing_cols:
+            st.error(f"❌ 資料缺少關鍵欄位：{missing_cols}")
+        else:
+            if discontinuities:
+                with st.expander(f"⚠️ 警告：偵測到 {len(discontinuities)} 處時間不連續", expanded=True):
+                    st.warning("請確認這是否為跨日或休市，否則技術指標可能失真。")
+                    st.write(discontinuities[:5]) # 只顯示前5個
 
-else:
-    st.info("👋 等待資料輸入中...")
+            # 2. 執行策略
+            params = {'entry_threshold': entry_threshold, 'exit_threshold': exit_threshold, 'hard_stop': hard_stop}
+            engine = StrategyEngine(df_clean, models, params)
+            
+            # 取得即時建議
+            pos_map = {"空手 (Empty)": "Empty", "多單 (Long)": "Long", "空單 (Short)": "Short"}
+            advice = engine.run_realtime_advice(pos_map[user_pos_type], user_entry_price, user_bars_held)
+            
+            # 取得歷史建議
+            df_history = engine.run_historical_review()
+            last_bar = df_clean.iloc[-1]
+
+            # --- A. 頂部關鍵數據卡片 ---
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("📊 最新時間", str(last_bar.get('Time', 'N/A'))[-5:]) # 只顯示 HH:MM
+            m2.metric("💰 收盤價", f"{last_bar.get('Close', 0):.0f}")
+            
+            # 根據建議類型變色
+            delta_color = "off"
+            if advice['Type'] in ['Buy', 'Exit']: delta_color = "normal" # 綠色/上升
+            elif advice['Type'] in ['Sell', 'Stop']: delta_color = "inverse" # 紅色/下降
+            
+            m3.metric("🤖 AI 決策", advice['Type'], delta=advice['Message'], delta_color=delta_color)
+            
+            pnl_show = f"{advice['PnL']:.0f}" if user_pos_type != "空手 (Empty)" else "-"
+            m4.metric("🎯 信心/損益", f"{advice['Confidence']:.0%}", delta=pnl_show)
+
+            st.markdown("---")
+
+            # --- B. 視覺化圖表 (K線 + 訊號) ---
+            # 為了效能，只畫最後 60 根
+            display_len = 60
+            df_chart = df_clean.tail(display_len)
+            df_hist_chart = df_history.tail(display_len)
+            
+            fig = go.Figure()
+            # 價格線
+            fig.add_trace(go.Scatter(x=df_chart['Time'], y=df_chart['Close'], mode='lines+markers', name='Price', line=dict(color='#1f77b4')))
+            
+            # 標記歷史上的買賣建議 (為了不讓圖太亂，只標進場點)
+            buys = df_hist_chart[df_hist_chart['Suggestion'].str.contains('買進')]
+            sells = df_hist_chart[df_hist_chart['Suggestion'].str.contains('放空')]
+            
+            if not buys.empty:
+                fig.add_trace(go.Scatter(x=buys['Time'], y=buys['Close'], mode='markers', name='Buy Signal', marker=dict(symbol='triangle-up', size=15, color='red')))
+            if not sells.empty:
+                fig.add_trace(go.Scatter(x=sells['Time'], y=sells['Close'], mode='markers', name='Sell Signal', marker=dict(symbol='triangle-down', size=15, color='green')))
+
+            fig.update_layout(
+                title="近 60 根 K 棒走勢與歷史訊號",
+                margin=dict(l=0, r=0, t=30, b=0),
+                height=350,
+                xaxis_type='category' # 避免時間不連續產生的空白
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            # --- C. 歷史建議表格 ---
+            st.subheader("📜 歷史訊號回放 (倒序)")
+            
+            # 格式化表格，讓它更像看盤軟體的明細
+            df_show = df_history[['Time', 'Close', 'Suggestion', 'Detail']].iloc[::-1] # 倒序
+            
+            # 使用 dataframe 的 column config 加上顏色條或圖示
+            st.dataframe(
+                df_show,
+                use_container_width=True,
+                height=300,
+                column_config={
+                    "Suggestion": st.column_config.TextColumn(
+                        "AI 建議",
+                        help="當時 AI 給出的操作建議",
+                    ),
+                    "Confidence": st.column_config.ProgressColumn(
+                        "信心度",
+                        format="%.2f",
+                        min_value=0,
+                        max_value=1,
+                    ),
+                }
+            )
+
+    else:
+        # 空白狀態的引導畫面
+        st.info("👈 請先在左側貼上 Excel 資料以啟動戰情室")
+        st.markdown("""
+        ### 🚀 快速上手指南
+        1. **複製資料**：從您的 Excel 或看盤軟體複製包含技術指標的數據。
+        2. **貼上**：貼到左側的文字框中。
+        3. **設定部位**：如果您手上已有單，請在左側設定，AI 會切換為「出場模式」。
+        4. **看訊號**：右側儀表板會即時顯示最新建議。
+        """)
