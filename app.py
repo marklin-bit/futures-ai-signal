@@ -159,7 +159,8 @@ class StrategyEngine:
                     if prob > self.params['exit_threshold']:
                         strat_pos = 0
                         strat_action = "🟢 出場"
-                        strat_detail = f"率 {prob:.0%}"
+                        # 修正: 顯示出場率並保留多空信心
+                        strat_detail = f"出場 {prob:.0%} (多:{prob_long:.0%}/空:{prob_short:.0%})"
                     else:
                         strat_action = "續抱"
                         strat_detail = f"帳 {pnl:.0f}"
@@ -178,7 +179,8 @@ class StrategyEngine:
                     if prob > self.params['exit_threshold']:
                         strat_pos = 0
                         strat_action = "🔴 出場"
-                        strat_detail = f"率 {prob:.0%}"
+                        # 修正: 顯示出場率並保留多空信心
+                        strat_detail = f"出場 {prob:.0%} (多:{prob_long:.0%}/空:{prob_short:.0%})"
                     else:
                         strat_action = "續抱"
                         strat_detail = f"帳 {pnl:.0f}"
@@ -188,15 +190,9 @@ class StrategyEngine:
             user_note = ""
             
             if u_pos == "Empty":
-                # 空手時，建議同進場模型
-                if prob_long > self.params['entry_threshold'] and prob_long > prob_short:
-                    user_advice = "🔥 訊號：買進"
-                    user_note = f"{prob_long:.0%}"
-                elif prob_short > self.params['entry_threshold'] and prob_short > prob_long:
-                    user_advice = "⚡ 訊號：放空"
-                    user_note = f"{prob_short:.0%}"
-                else:
-                    user_advice = "觀望"
+                # 修正: 空手時不顯示進場訊號，因為這是"持單建議"欄位
+                user_advice = "無持單"
+                user_note = "-"
             
             elif u_pos == "Long":
                 u_pnl = current_close - user_cost
