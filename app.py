@@ -53,8 +53,7 @@ class DataProcessor:
     def validate_time_continuity(self, df):
         if 'Time' not in df.columns: return [], "No Time Column"
         try:
-            # 這裡 df['Time'] 已經是 datetime 物件，直接使用
-            time_series = df['Time']
+            time_series = pd.to_datetime(df['Time'])
             diffs = time_series.diff()
             discontinuous_indices = []
             for i in range(1, len(diffs)):
@@ -85,7 +84,7 @@ class DataProcessor:
             try:
                 df['Time'] = pd.to_datetime(df['Time'])
             except:
-                pass # 若轉換失敗則維持原樣(可能導致排序不準)
+                pass 
 
         missing = []
         for col in self.feature_cols:
@@ -107,39 +106,26 @@ class StrategyEngine:
         self.processor = DataProcessor(None) # Helper
 
     def find_entry_info(self, entry_time_obj):
-        """
-        根據時間物件 (datetime.time) 尋找對應的 Index 和 Close Price
-        """
         if entry_time_obj is None: return -1, 0.0
-        
-        # 將 time 物件轉為字串 "HH:MM"
         time_str = entry_time_obj.strftime("%H:%M")
-        
-        # 在 df['Time'] 中尋找包含此時間字串的列
-        # 因為 df['Time'] 現在是 datetime 物件，需轉字串比對
         mask = self.df['Time'].astype(str).str.contains(time_str, na=False)
         matches = self.df[mask]
-        
         if not matches.empty:
-            idx = matches.index[-1] # 取最後一筆
+            idx = matches.index[-1] 
             price = matches.loc[idx, 'Close']
             return idx, price
         return -1, 0.0
 
     def run_historical_review(self, user_pos_type, entry_time_obj):
-        # 策略模擬變數
         strat_pos = 0 
         strat_entry_price = 0.0
         strat_entry_index = 0
         
-        # 使用者設定
         pos_map = {"空手 (Empty)": "Empty", "多單 (Long)": "Long", "空單 (Short)": "Short"}
         u_pos = pos_map.get(user_pos_type, "Empty")
         
-        # 自動查找成本與 Index
         user_entry_idx = -1
         user_cost = 0.0
-        
         if u_pos != "Empty":
             user_entry_idx, user_cost = self.find_entry_info(entry_time_obj)
 
@@ -152,13 +138,12 @@ class StrategyEngine:
             current_close = current_bar.get('Close', 0)
             current_time = current_bar.get('Time', f"K_{i}")
             
-            # 預先計算進場機率
             prob_long = self.models['Long_Entry_Model'].predict_proba(current_features)[0][1]
             prob_short = self.models['Short_Entry_Model'].predict_proba(current_features)[0][1]
             
             trend_str = f"(多:{prob_long:.0%}/空:{prob_short:.0%})"
 
-            # --- 1. 計算策略模擬 (Strategy Simulation) [🔴/🟢 圓形系統] ---
+            # --- 1. 計算策略模擬 ---
             strat_action = "⚪ 觀望"
             strat_detail = ""
 
@@ -220,7 +205,7 @@ class StrategyEngine:
                         hold_conf = 1.0 - prob
                         strat_detail = f"帳面{pnl:.0f}(續:{hold_conf:.0%}/多:{prob_long:.0%}/空:{prob_short:.0%})"
 
-            # --- 2. 計算使用者持單建議 (User Advice) ---
+            # --- 2. 計算使用者持單建議 ---
             user_advice = "-"
             user_note = ""
             
@@ -244,7 +229,6 @@ class StrategyEngine:
                 user_note = f"成本 {user_cost:.0f}"
 
             else:
-                # 持倉中
                 current_bars_held = i - user_entry_idx
                 
                 if u_pos == "Long":
@@ -310,6 +294,79 @@ class StrategyEngine:
             history_records.append(record)
             
         return pd.DataFrame(history_records)
+
+    def run_realtime_advice(self, user_position, entry_time_obj):
+        last_idx = len(self.df) - 1
+        current_features = self.df.iloc[[last_idx]][DataProcessor(None).feature_cols].copy()
+        current_close = self.df.iloc[last_idx].get('Close', 0)
+        
+        advice = {"Action": "Wait", "Confidence": 0.0, "PnL": 0.0, "Message": "資料不足", "Type": "Neutral", "Label": "進場信心"}
+
+        prob_long = self.models['Long_Entry_Model'].predict_proba(current_features)[0][1]
+        prob_short = self.models['Short_Entry_Model'].predict_proba(current_features)[0][1]
+
+        if user_position == 'Empty':
+            advice["Label"] = "進場信心"
+            if prob_long > self.params['entry_threshold'] and prob_long > prob_short:
+                advice.update({"Action": "Buy", "Confidence": prob_long, "Message": "🔥 多方強勢，建議買進", "Type": "Buy"})
+            elif prob_short > self.params['entry_threshold'] and prob_short > prob_long:
+                advice.update({"Action": "Sell", "Confidence": prob_short, "Message": "⚡ 空方強勢，建議放空", "Type": "Sell"})
+            else:
+                advice.update({"Action": "Wait", "Confidence": max(prob_long, prob_short), "Message": f"觀望 (多:{prob_long:.2f}/空:{prob_short:.2f})", "Type": "Wait"})
+        else:
+            user_entry_idx, entry_price = self.find_entry_info(entry_time_obj)
+            bars_held = 0
+            if user_entry_idx != -1 and last_idx >= user_entry_idx:
+                bars_held = last_idx - user_entry_idx
+            if bars_held < 0: bars_held = 0
+
+            if user_position == 'Long':
+                floating_pnl = current_close - entry_price
+                advice['PnL'] = floating_pnl
+                
+                if floating_pnl <= -self.params['hard_stop']:
+                    advice.update({"Action": "StopLoss", "Confidence": 1.0, "Message": f"🛑 觸發硬停損 (-{self.params['hard_stop']})", "Type": "Stop", "Label": "停損觸發"})
+                else:
+                    exit_feats = current_features.copy()
+                    exit_feats['Floating_PnL'] = floating_pnl
+                    exit_feats['Hold_Bars'] = bars_held
+                    exit_feats = exit_feats[DataProcessor(None).exit_feature_cols]
+                    
+                    exit_prob = self.models['Long_Exit_Model'].predict_proba(exit_feats)[0][1]
+                    
+                    if exit_prob > self.params['exit_threshold']:
+                        advice.update({"Action": "Exit", "Confidence": exit_prob, "Message": f"🚀 建議多單出場 (機率 {exit_prob:.0%})", "Type": "Exit", "Label": "出場機率"})
+                    else:
+                        hold_conf = 1.0 - exit_prob
+                        if prob_long > self.params['entry_threshold'] and prob_long > prob_short:
+                            advice.update({"Action": "Hold+", "Confidence": prob_long, "Message": "⚓ 續抱且出現多方訊號 (🔥可加碼)", "Type": "Buy", "Label": "加碼信心"})
+                        else:
+                            advice.update({"Action": "Hold", "Confidence": hold_conf, "Message": f"⚓ 建議續抱 (安心度 {hold_conf:.0%})", "Type": "Hold", "Label": "續抱信心"})
+
+            elif user_position == 'Short':
+                floating_pnl = entry_price - current_close
+                advice['PnL'] = floating_pnl
+                
+                if floating_pnl <= -self.params['hard_stop']:
+                    advice.update({"Action": "StopLoss", "Confidence": 1.0, "Message": f"🛑 觸發硬停損 (-{self.params['hard_stop']})", "Type": "Stop", "Label": "停損觸發"})
+                else:
+                    exit_feats = current_features.copy()
+                    exit_feats['Floating_PnL'] = floating_pnl
+                    exit_feats['Hold_Bars'] = bars_held
+                    exit_feats = exit_feats[DataProcessor(None).exit_feature_cols]
+                    
+                    exit_prob = self.models['Short_Exit_Model'].predict_proba(exit_feats)[0][1]
+                    
+                    if exit_prob > self.params['exit_threshold']:
+                        advice.update({"Action": "Exit", "Confidence": exit_prob, "Message": f"🚀 建議空單出場 (機率 {exit_prob:.0%})", "Type": "Exit", "Label": "出場機率"})
+                    else:
+                        hold_conf = 1.0 - exit_prob
+                        if prob_short > self.params['entry_threshold'] and prob_short > prob_long:
+                            advice.update({"Action": "Hold+", "Confidence": prob_short, "Message": "⚓ 續抱且出現空方訊號 (🔥可加碼)", "Type": "Sell", "Label": "加碼信心"})
+                        else:
+                            advice.update({"Action": "Hold", "Confidence": hold_conf, "Message": f"⚓ 建議續抱 (安心度 {hold_conf:.0%})", "Type": "Hold", "Label": "續抱信心"})
+
+        return advice
 
 # ==========================================
 # 3. 載入模型
@@ -380,7 +437,6 @@ with right_col:
             params = {'entry_threshold': entry_threshold, 'exit_threshold': exit_threshold, 'hard_stop': hard_stop}
             engine = StrategyEngine(df_clean, models, params)
             
-            # 執行回測與建議計算
             df_history = engine.run_historical_review(user_pos_type, user_entry_time)
             
             # --- A. 歷史訊號列表 (置頂) ---
@@ -394,8 +450,8 @@ with right_col:
                 use_container_width=True,
                 height=400,
                 column_config={
-                    # [Fix] 使用 DatetimeColumn 確保時間欄位可以正確排序
-                    "Time": st.column_config.DatetimeColumn("時間", format="MM-DD HH:mm", width="small"),
+                    # [Fix] 使用 DatetimeColumn 並設定格式為 HH:mm
+                    "Time": st.column_config.DatetimeColumn("時間", format="HH:mm", width="small"),
                     "Close": st.column_config.NumberColumn("收盤價", format="%.0f", width="small"),
                     "Strategy_Action": st.column_config.TextColumn("模型策略", help="若 AI 全自動交易的操作", width="small"),
                     "Strategy_Detail": st.column_config.TextColumn("策略細節", width="medium"),
@@ -409,11 +465,16 @@ with right_col:
             st.markdown("---")
             st.subheader("📊 近 60 根 K 棒走勢")
             
-            df_chart = df_clean.tail(60)
-            df_hist_chart = df_history.tail(60)
+            df_chart = df_clean.tail(60).copy()
+            df_hist_chart = df_history.tail(60).copy()
+            
+            # [Fix] 轉換時間為 HH:mm 字串，確保圖表顯示簡潔
+            df_chart['Time_Str'] = df_chart['Time'].dt.strftime('%H:%M')
+            df_hist_chart['Time_Str'] = df_hist_chart['Time'].dt.strftime('%H:%M')
             
             fig = go.Figure()
-            fig.add_trace(go.Scatter(x=df_chart['Time'], y=df_chart['Close'], mode='lines+markers', name='Price', line=dict(color='#1f77b4', width=2)))
+            # 使用 Time_Str 作為 X 軸
+            fig.add_trace(go.Scatter(x=df_chart['Time_Str'], y=df_chart['Close'], mode='lines+markers', name='Price', line=dict(color='#1f77b4', width=2)))
             
             buys = df_hist_chart[df_hist_chart['Strategy_Action'].str.contains('買進')]
             sells = df_hist_chart[df_hist_chart['Strategy_Action'].str.contains('放空')]
@@ -421,19 +482,21 @@ with right_col:
             exits_short = df_hist_chart[df_hist_chart['Strategy_Action'].str.contains('空出')]
             
             if not buys.empty:
-                fig.add_trace(go.Scatter(x=buys['Time'], y=buys['Close'], mode='markers', name='Buy', marker=dict(symbol='triangle-up', size=15, color='red')))
+                fig.add_trace(go.Scatter(x=buys['Time_Str'], y=buys['Close'], mode='markers', name='Buy', marker=dict(symbol='triangle-up', size=15, color='red')))
             if not sells.empty:
-                fig.add_trace(go.Scatter(x=sells['Time'], y=sells['Close'], mode='markers', name='Sell', marker=dict(symbol='triangle-down', size=15, color='green')))
+                fig.add_trace(go.Scatter(x=sells['Time_Str'], y=sells['Close'], mode='markers', name='Sell', marker=dict(symbol='triangle-down', size=15, color='green')))
             if not exits_long.empty:
-                fig.add_trace(go.Scatter(x=exits_long['Time'], y=exits_long['Close'], mode='markers', name='Exit Long', marker=dict(symbol='x', size=12, color='red'))) # 改紅X
+                fig.add_trace(go.Scatter(x=exits_long['Time_Str'], y=exits_long['Close'], mode='markers', name='Exit Long', marker=dict(symbol='x', size=12, color='red'))) 
             if not exits_short.empty:
-                fig.add_trace(go.Scatter(x=exits_short['Time'], y=exits_short['Close'], mode='markers', name='Exit Short', marker=dict(symbol='x', size=12, color='green'))) # 改綠X
+                fig.add_trace(go.Scatter(x=exits_short['Time_Str'], y=exits_short['Close'], mode='markers', name='Exit Short', marker=dict(symbol='x', size=12, color='green'))) 
             
             # [Added] 標記真實部位進場點
             real_entry_idx, _ = engine.find_entry_info(user_entry_time)
             
             if real_entry_idx != -1 and real_entry_idx in df_chart.index:
-                entry_row = df_clean.loc[real_entry_idx]
+                # 注意：這裡要從 df_chart 中取值，確保有 Time_Str
+                entry_time_str = df_chart.loc[real_entry_idx, 'Time_Str']
+                entry_close = df_chart.loc[real_entry_idx, 'Close']
                 
                 marker_symbol = 'star'
                 marker_color = 'red' if user_pos_type == "多單 (Long)" else 'green'
@@ -441,8 +504,8 @@ with right_col:
                 
                 if user_pos_type != "空手 (Empty)":
                     fig.add_trace(go.Scatter(
-                        x=[entry_row['Time']], 
-                        y=[entry_row['Close']], 
+                        x=[entry_time_str], 
+                        y=[entry_close], 
                         mode='markers', 
                         name=marker_name, 
                         marker=dict(symbol=marker_symbol, size=20, color=marker_color, line=dict(width=2, color='white'))
