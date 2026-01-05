@@ -304,17 +304,27 @@ class StrategyEngine:
 def push_to_github(file_path, df_to_save):
     token = st.secrets.get("GITHUB_TOKEN")
     repo_name = st.secrets.get("GITHUB_REPO")
-    if not token or not repo_name: return "❌ 請設定 Secrets"
+    
+    if not token or not repo_name:
+        return "❌ 缺少 GitHub 設定 (GITHUB_TOKEN, GITHUB_REPO)"
+    
+    # [Fix] 檢查 Repo 格式是否正確 (username/repo)
+    if "/" not in repo_name:
+        return f"❌ Repo 名稱格式錯誤: '{repo_name}'。請使用 'username/repo_name' 格式 (例如: myname/my-project)"
+
     try:
         g = Github(token)
         repo = g.get_repo(repo_name)
         csv_content = df_to_save.to_csv(index=False)
         try:
-            repo.update_file(repo.get_contents(file_path).path, f"Update {file_path}", csv_content, repo.get_contents(file_path).sha)
+            contents = repo.get_contents(file_path)
+            repo.update_file(contents.path, f"Update {file_path}", csv_content, contents.sha)
+            return "✅ 雲端更新成功！"
         except:
             repo.create_file(file_path, f"Create {file_path}", csv_content)
-        return "✅ 雲端存檔成功！"
-    except Exception as e: return f"❌ 失敗: {e}"
+            return "✅ 雲端建立成功！"
+    except Exception as e:
+        return f"❌ GitHub 推送失敗: {e}"
 
 # ==========================================
 # 5. UI 主程式
