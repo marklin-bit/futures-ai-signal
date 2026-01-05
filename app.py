@@ -44,7 +44,8 @@ class DataEngine:
         url = "https://ws.api.cnyes.com/ws/api/v1/charting/history"
         to_ts = int(datetime.now().timestamp())
         
-        # 抓取最近 300 筆 (確保涵蓋今日日盤)
+        # [Modify] 抓取量調回 300 (足夠涵蓋今日日盤 + 昨日夜盤)
+        # 依靠使用者上傳的 history.csv 來提供足夠的計算基底
         params = {"symbol": symbol, "resolution": "5", "to": to_ts, "limit": 300}
         headers = {
             "User-Agent": "Mozilla/5.0",
@@ -113,21 +114,20 @@ class DataEngine:
         df['Rel_Volume'] = V / vol_ma5
         
         # 5 & 6. KD (36, 3) - 手動計算
-        # RSV = (C - L36) / (H36 - L36) * 100
+        # [Checked] 移除 *100，讓數值維持在 0~1 (符合訓練資料格式)
         rsv_window = 36
         l_min = L.rolling(rsv_window).min()
         h_max = H.rolling(rsv_window).max()
-        rsv = (C - l_min) / (h_max - l_min) * 100
+        rsv = (C - l_min) / (h_max - l_min) # 0.0 ~ 1.0
         
         # EMA Smoothing for K and D (alpha=1/3)
-        # K = 2/3 * PrevK + 1/3 * RSV
-        k_vals = [50.0] * len(df)
-        d_vals = [50.0] * len(df)
+        # [Modify] 初始值設為 0.5 (對應 50%)
+        k_vals = [0.5] * len(df)
+        d_vals = [0.5] * len(df)
         
         # 轉成 numpy 加速
         rsv_np = rsv.to_numpy()
         
-        # 注意: 這裡假設歷史資料的第一筆已經有足夠長度，否則初期 KD 會從 50 開始收斂
         for i in range(1, len(df)):
             if np.isnan(rsv_np[i]): 
                 k_vals[i] = k_vals[i-1]
@@ -153,12 +153,9 @@ class DataEngine:
         df['Body_Ratio'] = (C - O).abs() / hl_range
         
         # 11. 星期 (1=Mon, ..., 5=Fri)
-        # Python .weekday(): 0=Mon, 6=Sun. 加1對應 1~7.
         df['Week'] = df['Time'].dt.weekday + 1
         
         # 12. 結算日 (Settlement_Day)
-        # 規則: IF(Wed or Fri, 1, 0) + IF(Monthly, 1, 0)
-        # 結果: 一般週三/週五=1, 月結算日(週三)=2, 其他=0
         def get_settlement(row):
             score = 0
             d = row['Time'].date()
@@ -170,10 +167,7 @@ class DataEngine:
             
         df['Settlement_Day'] = df.apply(get_settlement, axis=1)
         
-        # 13. 時段 (Time_Segment) - 依指定邏輯
-        # 08:50 ~ 09:30 -> 0 (盤初)
-        # 09:35 ~ 12:00 -> 1 (盤中)
-        # 12:05 ~ 13:30 (含收盤) -> 2 (盤尾)
+        # 13. 時段 (Time_Segment)
         def get_segment(t):
             hm = t.hour * 100 + t.minute
             if hm <= 930: return 0   # 08:50 - 09:30
@@ -281,7 +275,6 @@ class StrategyEngine:
                     else:
                         ep = self.models['Long_Exit_Model'].predict_proba(curr_feats[self.processor.exit_feature_cols].assign(Floating_PnL=pnl, Hold_Bars=hold_bars))[0][1]
                         
-                        # 格式: 帳面XX(出:XX%/多:XX%/空:XX%)
                         detail_exit = f"帳面{pnl:.0f}(出:{ep:.0%}{trend})"
                         detail_hold = f"帳面{pnl:.0f}(續:{1-ep:.0%}{trend})"
                         
@@ -377,12 +370,13 @@ with left:
                 
                 if not df_real.empty:
                     # 3. 合併 (History + Realtime)
+                    # [Critical] 確保即時資料接續在歷史資料之後，讓指標計算 (如 MA, KD) 延續
                     df_concat = pd.concat([df_hist, df_real]).drop_duplicates(subset='Time').sort_values('Time')
                     
                     # 4. 濾除夜盤
                     df_day = engine.filter_day_session(df_concat)
                     
-                    # 5. 計算指標
+                    # 5. 計算指標 (這時候 KD 會基於完整的歷史資料計算，不會再是 50 了)
                     df_final = engine.calculate_indicators(df_day)
                     
                     # 6. 顯示用：只取「今天」
@@ -396,7 +390,7 @@ with left:
                 else:
                     st.error("無法連線至鉅亨網，請檢查網路。")
         
-        # [Added] 指標驗證區
+        # 指標驗證區
         if not df_final.empty:
             with st.expander("🕵️‍♀️ 指標驗證區 (點擊展開)"):
                 st.caption("請對照 Excel 驗證以下數值是否正確:")
