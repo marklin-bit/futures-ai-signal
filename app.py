@@ -19,12 +19,6 @@ try:
 except ImportError:
     pass 
 
-# [Added] 引入 yfinance 作為備援資料源
-try:
-    import yfinance as yf
-except ImportError:
-    yf = None
-
 # ==========================================
 # 1. 網頁設定與全域參數
 # ==========================================
@@ -62,6 +56,7 @@ if 'df_view' not in st.session_state: st.session_state.df_view = pd.DataFrame()
 if 'entry_idx' not in st.session_state: st.session_state.entry_idx = -1
 if 'current_mode' not in st.session_state: st.session_state.current_mode = None 
 if 'last_update' not in st.session_state: st.session_state.last_update = None
+if 'data_source_note' not in st.session_state: st.session_state.data_source_note = ""
 
 # ==========================================
 # 2. 核心功能: 資料抓取與計算
@@ -87,45 +82,39 @@ class DataEngine:
         df[['Open', 'High', 'Low', 'Close', 'Volume']] = df[['Open', 'High', 'Low', 'Close', 'Volume']].apply(pd.to_numeric, errors='coerce')
         return df
 
-    def fetch_yahoo_fallback(self):
-        """[Backup] 使用 Yahoo Finance 抓取日盤資料"""
-        if yf is None: return pd.DataFrame()
+    def fetch_spot_fallback(self):
+        """[Backup] 使用 Anue 大盤加權指數 (TSE:001:INDEX) 抓取日盤資料"""
+        symbol = "TSE:001:INDEX" # 加權指數代碼
+        url = "https://ws.api.cnyes.com/ws/api/v1/charting/history"
+        headers = {"User-Agent": "Mozilla/5.0", "Referer": f"https://stock.cnyes.com/market/{symbol}"}
+        
+        # 抓取當日
+        to_ts = int(datetime.now().timestamp())
+        params = {"symbol": symbol, "resolution": "5", "to": to_ts, "limit": 300} # 300筆足夠涵蓋日盤
+        
         try:
-            # TXF=F 是台指期代碼
-            ticker = yf.Ticker("TXF=F")
-            # 抓取最近 2 天，5分K
-            df = ticker.history(period="2d", interval="5m")
-            if df.empty: return pd.DataFrame()
-            
-            df = df.reset_index()
-            # 處理時區
-            if df['Datetime'].dt.tz is None:
-                df['Datetime'] = df['Datetime'].dt.tz_localize('UTC').dt.tz_convert('Asia/Taipei')
-            else:
-                df['Datetime'] = df['Datetime'].dt.tz_convert('Asia/Taipei')
-            
-            # 格式統一
-            df = df.rename(columns={'Datetime': 'Time'})
-            df['Time'] = df['Time'].dt.tz_localize(None) # 移除時區資訊以便合併
-            # Yahoo 的時間是 K 棒開始時間，我們習慣用結束時間 (+5min)
-            df['Time'] = df['Time'] + timedelta(minutes=5)
-            
-            df = df[['Time', 'Open', 'High', 'Low', 'Close', 'Volume']]
-            return df
+            res = requests.get(url, params=params, headers=headers, timeout=5)
+            data = res.json().get('data', {})
+            if data.get('t'):
+                df = self._parse_api_response(data)
+                # 現貨日盤只到 13:30 (校正後 13:35)，保留這些資料
+                return df
         except:
-            return pd.DataFrame()
+            pass
+        return pd.DataFrame()
 
     def fetch_realtime_from_anue(self):
-        """雙引擎抓取：Anue 優先，若缺日盤則呼叫 Yahoo 救援"""
+        """雙引擎抓取：Anue期貨優先，若缺日盤則呼叫 Anue現貨(Spot) 救援"""
         symbol = "TWF:TXF:FUTURES"
         url = "https://ws.api.cnyes.com/ws/api/v1/charting/history"
         headers = {"User-Agent": "Mozilla/5.0", "Referer": f"https://stock.cnyes.com/market/{symbol}"}
         
-        # 1. 嘗試 Anue
+        # 1. 嘗試 Anue 期貨 (最新的)
         to_ts = int(datetime.now().timestamp())
         params = {"symbol": symbol, "resolution": "5", "to": to_ts, "limit": 1000}
         
         df_final = pd.DataFrame()
+        source_note = "純期貨數據"
         
         try:
             res = requests.get(url, params=params, headers=headers, timeout=5)
@@ -134,24 +123,28 @@ class DataEngine:
                 df_final = self._parse_api_response(data)
                 
                 # 2. [斷層偵測]
-                # 如果抓回來的資料都是 15:00 以後的 (夜盤)，但現在時間超過晚上，代表早上的日盤丟了
+                # 如果抓回來的資料都是 15:00 以後的 (夜盤)，代表早上的日盤丟了
                 if not df_final.empty:
                     min_hour = df_final['Time'].dt.hour.min()
                     # 如果最早的一筆資料已經是下午 3 點以後
                     if min_hour >= 15:
-                        # 3. [啟動 Yahoo 救援]
-                        st.toast("偵測到 Anue 日盤資料缺失，啟動 Yahoo Finance 救援...", icon="🚑")
-                        df_yahoo = self.fetch_yahoo_fallback()
+                        # 3. [啟動 現貨 救援]
+                        st.toast("偵測到期貨日盤缺失，啟動「加權指數(現貨)」救援...", icon="🚑")
+                        df_spot = self.fetch_spot_fallback()
                         
-                        if not df_yahoo.empty:
-                            # 過濾出 Yahoo 的日盤資料 (08:45 ~ 13:45)
-                            mask_day = (df_yahoo['Time'].dt.hour >= 8) & (df_yahoo['Time'].dt.hour < 14)
-                            df_yahoo_day = df_yahoo[mask_day]
+                        if not df_spot.empty:
+                            # 過濾出日盤資料 (09:00 ~ 13:45)
+                            # 現貨通常 09:05(第一根) ~ 13:35(最後一根)
+                            mask_day = (df_spot['Time'].dt.hour >= 9) & (df_spot['Time'].dt.hour < 14)
+                            df_spot_day = df_spot[mask_day]
                             
-                            # 合併：Yahoo日盤 + Anue夜盤
-                            df_final = pd.concat([df_yahoo_day, df_final]).drop_duplicates(subset='Time', keep='last').sort_values('Time')
-                            st.toast(f"成功補回 {len(df_yahoo_day)} 筆日盤資料！", icon="✅")
+                            # 合併：現貨日盤 + 期貨夜盤
+                            # 注意：兩者有價差 (Basis)，會在圖表上形成缺口，但在技術指標計算上能提供連續性
+                            df_final = pd.concat([df_spot_day, df_final]).drop_duplicates(subset='Time', keep='last').sort_values('Time')
+                            source_note = "混和數據 (日盤:現貨 / 夜盤:期貨)"
+                            st.toast(f"成功補回 {len(df_spot_day)} 筆日盤資料！(注意：含現貨價差)", icon="✅")
             
+            st.session_state.data_source_note = source_note
             return df_final
 
         except Exception as e:
@@ -161,6 +154,7 @@ class DataEngine:
     def filter_day_session(self, df):
         if df.empty: return df
         df = df.set_index('Time').sort_index()
+        # 包含 09:00 (現貨開盤) 到 13:50
         return df.between_time(dt_time(8, 45), dt_time(13, 50)).reset_index()
 
     def calculate_indicators(self, df, mode='day'):
@@ -362,7 +356,7 @@ def process_data(mode):
     df_hist = pd.read_csv(MASTER_HIST_FILE) if os.path.exists(MASTER_HIST_FILE) else pd.DataFrame()
     if not df_hist.empty: df_hist['Time'] = pd.to_datetime(df_hist['Time'])
     
-    # [Smart Fetch] 自動抓取 + 自動回補 (Anue + Yahoo)
+    # [Smart Fetch] 自動抓取 + 自動回補 (Anue 期貨 + Anue 現貨)
     df_real = engine.fetch_realtime_from_anue()
     
     if not df_real.empty:
@@ -406,7 +400,12 @@ if trigger_full:
 if not st.session_state.df_view.empty and models:
     mode_name = "🌞 日盤" if st.session_state.current_mode == 'day' else "🌙 全盤"
     st.title(f"{mode_name}戰情室")
-    st.caption(f"最後更新: {st.session_state.last_update.strftime('%H:%M:%S') if st.session_state.last_update else '-'}")
+    
+    # 標題下方加入資料來源註記
+    if st.session_state.data_source_note:
+        st.caption(f"ℹ️ 資料來源: {st.session_state.data_source_note} | 最後更新: {st.session_state.last_update.strftime('%H:%M:%S')}")
+    else:
+        st.caption(f"最後更新: {st.session_state.last_update.strftime('%H:%M:%S')}")
     
     if len(st.session_state.df_view) < 50:
         st.warning(f"⚠️ 資料筆數 ({len(st.session_state.df_view)}) 不足，技術指標可能偏差。")
