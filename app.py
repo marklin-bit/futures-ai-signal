@@ -70,36 +70,32 @@ class DataEngine:
         ]
         self.exit_feature_cols = self.feature_cols + ['Floating_PnL', 'Hold_Bars']
 
-    def _parse_anue_response(self, data):
-        if not data.get('t'): return pd.DataFrame()
-        df = pd.DataFrame({
-            'Time': pd.to_datetime(data['t'], unit='s'),
-            'Open': data['o'], 'High': data['h'], 'Low': data['l'], 'Close': data['c'], 'Volume': data['v']
-        })
-        # Anue 時間校正: UTC -> Taiwan -> +5min
-        df['Time'] = df['Time'].dt.tz_localize('UTC').dt.tz_convert('Asia/Taipei').dt.tz_localize(None)
-        df['Time'] = df['Time'] + timedelta(minutes=5)
-        df[['Open', 'High', 'Low', 'Close', 'Volume']] = df[['Open', 'High', 'Low', 'Close', 'Volume']].apply(pd.to_numeric, errors='coerce')
-        return df
-
-    def fetch_yahoo_tw_fallback(self):
-        """[Backup] 使用 Yahoo 奇摩股市 API (WTX00) 抓取日盤資料"""
-        symbol = "WTX00" # 台指期連續
-        # 使用我們測試成功的 API URL
-        url = f"https://tw.stock.yahoo.com/_td-stock/api/resource/FinanceChartService.ApacLibraCharts;symbols=%5B%22{symbol}%22%5D;type=K;range=1d;period=5m"
+    def fetch_yahoo_futures(self):
+        """
+        單一資料源：Yahoo 奇摩股市 (WTX& - 台指期連續)
+        優點：包含完整的日盤與夜盤資料，無需拼接。
+        """
+        # URL 編碼注意: symbols=["WTX&"] -> %5B%22WTX%26%22%5D
+        # range=5d: 抓取近 5 天，確保跨過週末與國定假日也能有足夠資料算指標
+        url = "https://tw.stock.yahoo.com/_td-stock/api/resource/FinanceChartService.ApacLibraCharts;symbols=%5B%22WTX%26%22%5D;type=K;range=5d;period=5m"
         
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "Referer": "https://tw.stock.yahoo.com/"
+            "Referer": "https://tw.stock.yahoo.com/future/WTX&/technical-analysis"
         }
         
+        df_final = pd.DataFrame()
+        source_note = "Yahoo 奇摩股市 (WTX&)"
+        
         try:
-            res = requests.get(url, headers=headers, timeout=8)
-            if res.status_code != 200: return pd.DataFrame()
+            res = requests.get(url, headers=headers, timeout=10)
+            if res.status_code != 200:
+                st.error(f"Yahoo API 連線失敗 (Code: {res.status_code})")
+                return pd.DataFrame()
             
             data = res.json()
             
-            # 解析 JSON (相容 List 或 Dict 結構)
+            # 解析 JSON 結構
             chart = None
             if isinstance(data, dict) and 'data' in data:
                 chart = data['data'][0]['chart']
@@ -124,84 +120,49 @@ class DataEngine:
                     # Yahoo 時間處理: UTC -> Taiwan
                     df['Time'] = df['Time'].dt.tz_localize('UTC').dt.tz_convert('Asia/Taipei').dt.tz_localize(None)
                     
-                    # 簡單檢查資料有效性
-                    df = df.dropna(subset=['Close'])
+                    # [時間校正]
+                    # Yahoo 給的是 K 棒「開始時間」(例如 09:00)，我們習慣看「結束時間」(09:05)
+                    df['Time'] = df['Time'] + timedelta(minutes=5)
                     
-                    return df
-        except:
-            pass
-        return pd.DataFrame()
-
-    def fetch_realtime_from_anue(self):
-        """雙引擎抓取：Anue(主) + Yahoo TW(救援)"""
-        symbol = "TWF:TXF:FUTURES"
-        url = "https://ws.api.cnyes.com/ws/api/v1/charting/history"
-        headers = {"User-Agent": "Mozilla/5.0", "Referer": f"https://stock.cnyes.com/market/{symbol}"}
-        
-        to_ts = int(datetime.now().timestamp())
-        params = {"symbol": symbol, "resolution": "5", "to": to_ts, "limit": 1000}
-        
-        df_final = pd.DataFrame()
-        source_note = "鉅亨網 (Anue)"
-        
-        try:
-            # 1. 嘗試 Anue
-            res = requests.get(url, params=params, headers=headers, timeout=5)
-            data = res.json().get('data', {})
-            if data.get('t'):
-                df_final = self._parse_anue_response(data)
-                
-                # 2. [斷層偵測]
-                # 如果抓回來的資料都是 15:00 以後的 (夜盤)，但現在時間是晚上，代表早上的日盤丟了
-                if not df_final.empty:
-                    min_hour = df_final['Time'].dt.hour.min()
-                    # 如果最早的一筆資料已經是下午 3 點以後 (且資料筆數看起來不像是只有幾分鐘)
-                    if min_hour >= 15:
-                        # 3. [啟動 Yahoo TW 救援]
-                        st.toast("偵測到日盤資料缺失，啟動 Yahoo TW (WTX00) 救援...", icon="🚑")
-                        df_yahoo = self.fetch_yahoo_tw_fallback()
-                        
-                        if not df_yahoo.empty:
-                            # 過濾出 Yahoo 的日盤資料 (08:45 ~ 13:45)
-                            mask_day = (df_yahoo['Time'].dt.hour >= 8) & (df_yahoo['Time'].dt.hour < 14)
-                            df_yahoo_day = df_yahoo[mask_day]
-                            
-                            if not df_yahoo_day.empty:
-                                # 合併：Yahoo日盤 + Anue夜盤
-                                df_final = pd.concat([df_yahoo_day, df_final]).drop_duplicates(subset='Time', keep='last').sort_values('Time')
-                                source_note = "混和數據 (日盤:Yahoo / 夜盤:Anue)"
-                                st.toast(f"救援成功！補回 {len(df_yahoo_day)} 筆日盤資料", icon="✅")
+                    # 簡單檢查資料有效性 (濾掉尚未開盤的空值)
+                    df = df.dropna(subset=['Close'])
+                    df_final = df
             
             st.session_state.data_source_note = source_note
             return df_final
 
         except Exception as e:
             st.error(f"API Error: {e}")
-            return df_final
+            return pd.DataFrame()
 
     def filter_day_session(self, df):
         if df.empty: return df
         df = df.set_index('Time').sort_index()
-        # 寬鬆過濾
+        # 寬鬆過濾 (確保包含 08:50 的第一根 與 13:45 的最後一根)
         return df.between_time(dt_time(8, 45), dt_time(13, 50)).reset_index()
 
     def calculate_indicators(self, df, mode='day'):
+        """
+        在本地端計算技術指標，確保與 AI 模型訓練時的邏輯完全一致。
+        """
         if df.empty: return df
         df = df.sort_values('Time').reset_index(drop=True)
         
         C = df['Close']; H = df['High']; L = df['Low']; O = df['Open']; V = df['Volume']
         
+        # 1. 布林通道 (20, 2)
         ma20 = C.rolling(20).mean()
         std20 = C.rolling(20).std()
-        
         df['UB'] = ma20 + 2 * std20
         df['LB'] = ma20 - 2 * std20
         df['Bandwidth'] = df['UB'] - df['LB']
         
+        # 2. 其他特徵
         df['MA_Slope'] = np.sign(ma20.diff()) 
         df['Bandwidth_Rate'] = df['Bandwidth'].pct_change()
         df['Rel_Volume'] = V / V.rolling(5).mean()
         
+        # 3. KD (36, 3) - 使用 Pandas EWM 平滑，模擬遞迴計算
         rsv = (C - L.rolling(36).min()) / (H.rolling(36).max() - L.rolling(36).min())
         df['K'] = rsv.ewm(alpha=1/3, adjust=False).mean()
         df['D'] = df['K'].ewm(alpha=1/3, adjust=False).mean()
@@ -220,6 +181,7 @@ class DataEngine:
             hm = df['Time'].dt.hour * 100 + df['Time'].dt.minute
             df['Time_Segment'] = np.select([hm <= 930, hm <= 1200], [0, 1], default=2)
         
+        # 填補 NaN (避免模型報錯)，但保留 Close/UB/LB 的 NaN 以便繪圖斷開
         df[self.feature_cols] = df[self.feature_cols].fillna(method='bfill').fillna(0)
         return df
 
@@ -384,11 +346,13 @@ def process_data(mode):
     df_hist = pd.read_csv(MASTER_HIST_FILE) if os.path.exists(MASTER_HIST_FILE) else pd.DataFrame()
     if not df_hist.empty: df_hist['Time'] = pd.to_datetime(df_hist['Time'])
     
-    # [Smart Fetch] 自動抓取 (Anue + Yahoo TW 救援)
-    df_real = engine.fetch_realtime_from_anue()
+    # [Single Source] 統一使用 Yahoo WTX& 抓取
+    df_real = engine.fetch_yahoo_futures()
     
     if not df_real.empty:
+        # 合併並去除重複
         df_total = pd.concat([df_hist, df_real]).drop_duplicates(subset='Time', keep='last').sort_values('Time')
+        # 存檔
         save_cols = ['Time', 'Open', 'High', 'Low', 'Close', 'Volume']
         df_total[save_cols].to_csv(MASTER_HIST_FILE, index=False)
     else:
