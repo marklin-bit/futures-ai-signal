@@ -15,7 +15,7 @@ except ImportError:
 
 # [Added] 引入 PyGithub
 try:
-    from github import Github, Auth
+    from github import Github, Auth, GithubException
 except ImportError:
     pass 
 
@@ -93,6 +93,7 @@ class DataEngine:
         headers = {"User-Agent": "Mozilla/5.0", "Referer": f"https://stock.cnyes.com/market/{symbol}"}
         
         to_ts = int(datetime.now().timestamp())
+        # 抓取 1000 筆 (約 3-4 天)
         params = {"symbol": symbol, "resolution": "5", "to": to_ts, "limit": 1000}
         
         try:
@@ -122,23 +123,28 @@ class DataEngine:
         # 2. 處理新資料
         new_df = api_df.copy()
         if not new_df.empty and is_day_mode:
-            # 日盤模式過濾
+            # 日盤模式：嚴格過濾，只保留 08:45 ~ 13:45 的資料
             new_df = new_df.set_index('Time').sort_index()
             new_df = new_df.between_time(dt_time(8, 45), dt_time(13, 45)).reset_index()
 
-        # 3. 合併
+        # 3. 合併與去重
         if not new_df.empty:
             if not hist_df.empty:
                 full_df = pd.concat([hist_df, new_df])
             else:
                 full_df = new_df
             
-            # 去重排序
+            # 依時間去重，保留最新的數據
             full_df = full_df.drop_duplicates(subset='Time', keep='last').sort_values('Time').reset_index(drop=True)
         else:
             full_df = hist_df
 
-        # 4. [新增] 自動清理：只保留最近 5 個交易日的資料
+        # 確保日盤歷史檔不含雜質
+        if is_day_mode and not full_df.empty:
+             full_df = full_df.set_index('Time').sort_index()
+             full_df = full_df.between_time(dt_time(8, 45), dt_time(13, 45)).reset_index()
+
+        # 4. 自動清理：只保留最近 5 個交易日
         if not full_df.empty:
             unique_dates = full_df['Time'].dt.date.unique()
             unique_dates.sort()
@@ -305,15 +311,17 @@ def push_to_github(file_path, df_to_save):
     repo_name = st.secrets.get("GITHUB_REPO")
     
     if not token or not repo_name:
-        return "❌ 缺少 GitHub 設定 (GITHUB_TOKEN, GITHUB_REPO)"
+        return "❌ 缺少 GitHub 設定"
     
-    # [Fix] 檢查 Repo 格式是否正確 (username/repo)
+    # Repo 格式檢查
     if "/" not in repo_name:
-        return f"❌ Repo 名稱格式錯誤: '{repo_name}'。請使用 'username/repo_name' 格式 (例如: myname/my-project)"
+        return f"❌ Repo 名稱錯誤: '{repo_name}'。請務必使用 'username/repo_name' 格式！"
 
     try:
         g = Github(token)
+        # 這裡會觸發 404 如果 Token 權限不夠或 Repo 不存在
         repo = g.get_repo(repo_name)
+        
         csv_content = df_to_save.to_csv(index=False)
         try:
             contents = repo.get_contents(file_path)
@@ -323,6 +331,15 @@ def push_to_github(file_path, df_to_save):
             repo.create_file(file_path, f"Create {file_path}", csv_content)
             return "✅ 雲端建立成功！"
     except Exception as e:
+        # [Fix] 更詳細的錯誤提示
+        err_msg = str(e)
+        if "404" in err_msg and "Not Found" in err_msg:
+            return (
+                f"❌ GitHub 回傳 404 錯誤 (找不到 Repo)。請檢查：\n"
+                f"1. Token 是否已勾選 'repo' (Full control) 權限？(私有庫必須)\n"
+                f"2. Repo 名稱 '{repo_name}' 是否完全正確？\n"
+                f"3. 該 Repo 是否真的存在？"
+            )
         return f"❌ GitHub 推送失敗: {e}"
 
 # ==========================================
@@ -363,10 +380,6 @@ with st.sidebar:
         
         tab_db_day, tab_db_full = st.tabs(["日盤庫", "全盤庫"])
         
-        # 定義兩個獨立的資料庫檔案 (與上面一致)
-        HIST_FILE_DAY = 'history_data_day.csv'
-        HIST_FILE_FULL = 'history_data_full.csv'
-
         with tab_db_day:
             up_day = st.file_uploader("上傳日盤歷史", type=['csv'], key="up_day")
             if up_day:
@@ -395,7 +408,7 @@ def process_data(mode):
     api_df = engine.fetch_anue_raw()
     
     # 3. 讀取與合併
-    # [Fix] 即使 API 無資料，若有歷史檔，也應視為成功
+    # 注意: merge_and_save 裡面會負責日盤過濾 & 自動清理
     final_df = engine.merge_and_save(api_df, hist_file, is_day_mode=(mode=='day'))
     
     if final_df.empty:
@@ -407,7 +420,6 @@ def process_data(mode):
         status = "⚠️ API 無新資料，僅顯示歷史存檔 (可能已收盤)"
     
     # 4. 計算指標
-    # (此時 final_df 已經是乾淨且長度適中的日盤或全盤資料)
     df_calc = engine.calculate_indicators(final_df, mode=mode)
     
     return df_calc, status
@@ -417,12 +429,11 @@ if trigger_day:
         df_res, status = process_data('day')
         
         if not df_res.empty:
-            # 即使 status 有警告，只要有資料我們就顯示
             st.session_state.df_view = df_res
             st.session_state.current_mode = 'day'
             st.session_state.last_update = datetime.now()
             
-            # 如果不是 OK，就 toast 警告一下
+            # [Fix] 如果不是 OK，就 toast 警告一下，不要顯示綠色成功
             if status != "OK":
                 st.toast(status, icon="⚠️")
         else:
@@ -454,54 +465,4 @@ if not st.session_state.df_view.empty and models:
         st.warning(f"⚠️ 資料筆數 ({len(st.session_state.df_view)}) 不足，技術指標可能偏差。")
 
     strat = StrategyEngine(models, {'entry': p_entry, 'exit': p_exit, 'stop': p_stop}, st.session_state.df_view)
-    df_display, entry_idx = strat.run_analysis(u_pos, u_time)
-    
-    df_chart = df_display.copy()
-    df_chart['Time_Str'] = df_chart['Time'].dt.strftime('%H:%M')
-    total_len = len(df_chart)
-    default_range_start = max(0, total_len - 150)
-    
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df_chart['Time_Str'], y=df_chart['UB'], mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
-    fig.add_trace(go.Scatter(x=df_chart['Time_Str'], y=df_chart['LB'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(173, 216, 230, 0.2)', name='BB'))
-    fig.add_trace(go.Scatter(x=df_chart['Time_Str'], y=df_chart['Close'], mode='lines', name='Price', line=dict(color='#1f77b4', width=2)))
-    
-    for action, symbol, color, name in [('買進', 'triangle-up', 'red', 'Buy'), ('放空', 'triangle-down', 'green', 'Sell'), ('出', 'x', 'gray', 'Exit')]:
-        mask = df_chart['Strategy_Action'].str.contains(action)
-        if mask.any():
-            subset = df_chart[mask]
-            fig.add_trace(go.Scatter(x=subset['Time'].dt.strftime('%H:%M'), y=subset['Close'], mode='markers', marker=dict(symbol=symbol, size=12, color=color), name=name))
-
-    if entry_idx != -1 and entry_idx in df_chart.index:
-        row = df_chart.loc[entry_idx]
-        fig.add_trace(go.Scatter(x=[row['Time_Str']], y=[row['Close']], mode='markers', marker=dict(symbol='star', size=18, color='gold', line=dict(width=1, color='black')), name='My Entry'))
-
-    fig.update_layout(
-        height=500, margin=dict(t=30, l=0, r=0, b=0),
-        xaxis=dict(type='category', rangeslider=dict(visible=True), range=[default_range_start, total_len-1]),
-        legend=dict(orientation="h", y=1.02, x=1, xanchor="right"),
-        hovermode="x unified"
-    )
-    st.plotly_chart(fig, use_container_width=True)
-    
-    st.subheader("📜 訊號履歷")
-    st.dataframe(
-        df_display.iloc[::-1],
-        height=400,
-        column_config={
-            "Time": st.column_config.DatetimeColumn("時間", format="MM-dd HH:mm", width="small"),
-            "Close": st.column_config.NumberColumn("價位", format="%d", width="small"),
-            "Strategy_Action": st.column_config.TextColumn("策略", width="small"),
-            "Strategy_Detail": st.column_config.TextColumn("多空機率", width="medium"),
-            "User_Advice": st.column_config.TextColumn("建議", width="small"),
-            "User_Note": st.column_config.TextColumn("持倉損益", width="medium"),
-            "UB": None, "LB": None
-        },
-        use_container_width=True,
-        hide_index=True
-    )
-    
-elif models is None:
-    st.warning("⚠️ 請確認 models/ 資料夾內是否有 4 個 .pkl 模型檔")
-else:
-    st.info("👈 請點擊左側「🌞 更新日盤」或「🌙 更新全盤」")
+    df_display, entry_idx = strat.run_analysis(u_pos,
