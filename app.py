@@ -7,6 +7,11 @@ import plotly.graph_objects as go
 import os
 from datetime import datetime, timedelta, time as dt_time
 import io
+# [Added] 引入 PyGithub 用於寫回檔案
+try:
+    from github import Github, Auth
+except ImportError:
+    st.error("請在 requirements.txt 中加入 'PyGithub'")
 
 # 1. 網頁設定
 st.set_page_config(page_title="AI 交易訊號戰情室 (Pro)", layout="wide", initial_sidebar_state="expanded")
@@ -20,7 +25,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# 2026 年月結算日清單 (預估為每月第三個週三)
+# 2026 年月結算日清單
 SETTLEMENT_DATES_2026 = {
     '2026-01-21', '2026-02-18', '2026-03-18', '2026-04-15', '2026-05-20', '2026-06-17',
     '2026-07-15', '2026-08-19', '2026-09-16', '2026-10-21', '2026-11-18', '2026-12-16'
@@ -44,7 +49,7 @@ class DataEngine:
         url = "https://ws.api.cnyes.com/ws/api/v1/charting/history"
         to_ts = int(datetime.now().timestamp())
         
-        # 抓取最近 300 筆 (足夠涵蓋今日日盤 + 昨日夜盤)
+        # 抓取最近 300 筆
         params = {"symbol": symbol, "resolution": "5", "to": to_ts, "limit": 300}
         headers = {
             "User-Agent": "Mozilla/5.0",
@@ -60,7 +65,7 @@ class DataEngine:
                     'Time': pd.to_datetime(data['t'], unit='s'),
                     'Open': data['o'], 'High': data['h'], 'Low': data['l'], 'Close': data['c'], 'Volume': data['v']
                 })
-                # 時區轉換與時間校正 (+5分鐘: 開盤時間->收盤時間)
+                # 時區轉換與時間校正 (+5分鐘)
                 df['Time'] = df['Time'].dt.tz_localize('UTC').dt.tz_convert('Asia/Taipei').dt.tz_localize(None)
                 df['Time'] = df['Time'] + timedelta(minutes=5)
                 
@@ -74,15 +79,10 @@ class DataEngine:
         """過濾日盤 (08:50 ~ 13:45)"""
         if df.empty: return df
         df = df.set_index('Time').sort_index()
-        # 結算日可能 13:30 收，正常日 13:45
         df_day = df.between_time(dt_time(8, 50), dt_time(13, 45)).reset_index()
         return df_day
 
     def calculate_indicators(self, df, mode='day'):
-        """
-        依照使用者指定的公式計算 13 個特徵
-        mode: 'day' (日盤模式) 或 'full' (全盤模式)
-        """
         if df.empty: return df
         df = df.sort_values('Time').reset_index(drop=True)
         
@@ -97,19 +97,16 @@ class DataEngine:
         std20 = C.rolling(20).std()
         ub = ma20 + 2 * std20
         lb = ma20 - 2 * std20
-        
         df['Bandwidth'] = ub - lb
         
-        # 2. MA斜率 (MA_Slope): 正值1, 負值-1, 0為0
-        # 邏輯: 當前MA - 前一次MA
+        # 2. MA斜率
         ma_diff = ma20.diff()
         df['MA_Slope'] = np.sign(ma_diff).fillna(0) 
         
-        # 3. 布林頻寬變化率 (Bandwidth_Rate)
-        # (當前BW - 前一次BW) / 前一次BW
+        # 3. 布林頻寬變化率
         df['Bandwidth_Rate'] = df['Bandwidth'].pct_change()
         
-        # 4. 相對成交量 (Rel_Volume) = V / 5MA_V
+        # 4. 相對成交量
         vol_ma5 = V.rolling(5).mean()
         df['Rel_Volume'] = V / vol_ma5
         
@@ -130,7 +127,6 @@ class DataEngine:
             else:
                 k_vals[i] = (2/3) * k_vals[i-1] + (1/3) * rsv_np[i]
                 d_vals[i] = (2/3) * d_vals[i-1] + (1/3) * k_vals[i]
-                
         df['K'] = k_vals
         df['D'] = d_vals
         
@@ -151,11 +147,9 @@ class DataEngine:
         df['Week'] = df['Time'].dt.weekday + 1
         
         if mode == 'full':
-            # 全盤模式：強制設定
             df['Settlement_Day'] = 0
             df['Time_Segment'] = 1
         else:
-            # 日盤模式：正常計算
             # 12. 結算日
             def get_settlement(row):
                 score = 0
@@ -234,10 +228,8 @@ class StrategyEngine:
                 if pnl <= -self.params['stop']:
                     s_pos, s_action, s_detail = 0, "💥 停損", f"損 {pnl:.0f}"
                 else:
-                    # [Fix] 先 assign 欄位，再選取 exit_feature_cols
                     curr_feats_exit = curr_feats.assign(Floating_PnL=pnl, Hold_Bars=i-s_idx)
                     exit_prob = self.models['Long_Exit_Model'].predict_proba(curr_feats_exit[self.processor.exit_feature_cols])[0][1]
-                    
                     if exit_prob > self.params['exit']:
                         s_pos, s_action, s_detail = 0, "❌ 多出", f"帳{pnl:.0f}(出:{exit_prob:.0%})"
                     else:
@@ -247,10 +239,8 @@ class StrategyEngine:
                 if pnl <= -self.params['stop']:
                     s_pos, s_action, s_detail = 0, "💥 停損", f"損 {pnl:.0f}"
                 else:
-                    # [Fix] 先 assign 欄位，再選取 exit_feature_cols
                     curr_feats_exit = curr_feats.assign(Floating_PnL=pnl, Hold_Bars=i-s_idx)
                     exit_prob = self.models['Short_Exit_Model'].predict_proba(curr_feats_exit[self.processor.exit_feature_cols])[0][1]
-                    
                     if exit_prob > self.params['exit']:
                         s_pos, s_action, s_detail = 0, "❎ 空出", f"帳{pnl:.0f}(出:{exit_prob:.0%})"
                     else:
@@ -273,33 +263,35 @@ class StrategyEngine:
                     if pnl <= -self.params['stop']:
                         u_action, u_note = "💥 停損", f"{pnl:.0f}"
                     else:
-                        # [Fix] 先 assign 欄位，再選取 exit_feature_cols
                         curr_feats_exit = curr_feats.assign(Floating_PnL=pnl, Hold_Bars=hold_bars)
                         ep = self.models['Long_Exit_Model'].predict_proba(curr_feats_exit[self.processor.exit_feature_cols])[0][1]
                         
-                        detail = f"帳面{pnl:.0f}(出:{ep:.0%}{trend})"
+                        detail_exit = f"帳面{pnl:.0f}(出:{ep:.0%}{trend})"
+                        detail_hold = f"帳面{pnl:.0f}(續:{1-ep:.0%}{trend})"
+                        
                         if ep > self.params['exit']:
-                            u_action, u_note = "❌ 出場", detail
+                            u_action, u_note = "❌ 出場", detail_exit
                         elif p_long > self.params['entry'] and p_long > p_short:
-                            u_action, u_note = "🔥 加碼", detail
+                            u_action, u_note = "🔥 加碼", detail_hold
                         else:
-                            u_action, u_note = "⏳ 續抱", detail
+                            u_action, u_note = "⏳ 續抱", detail_hold
                 elif u_pos == "Short":
                     pnl = user_cost - curr_close
                     if pnl <= -self.params['stop']:
                         u_action, u_note = "💥 停損", f"{pnl:.0f}"
                     else:
-                        # [Fix] 先 assign 欄位，再選取 exit_feature_cols
                         curr_feats_exit = curr_feats.assign(Floating_PnL=pnl, Hold_Bars=hold_bars)
                         ep = self.models['Short_Exit_Model'].predict_proba(curr_feats_exit[self.processor.exit_feature_cols])[0][1]
                         
-                        detail = f"帳面{pnl:.0f}(出:{ep:.0%}{trend})"
+                        detail_exit = f"帳面{pnl:.0f}(出:{ep:.0%}{trend})"
+                        detail_hold = f"帳面{pnl:.0f}(續:{1-ep:.0%}{trend})"
+                        
                         if ep > self.params['exit']:
-                            u_action, u_note = "❎ 出場", detail
+                            u_action, u_note = "❎ 出場", detail_exit
                         elif p_short > self.params['entry'] and p_short > p_long:
-                            u_action, u_note = "🔥 加碼", detail
+                            u_action, u_note = "🔥 加碼", detail_hold
                         else:
-                            u_action, u_note = "⏳ 續抱", detail
+                            u_action, u_note = "⏳ 續抱", detail_hold
 
             history_records.append({
                 'Time': curr_time, 'Close': curr_close,
@@ -313,7 +305,40 @@ class StrategyEngine:
         return pd.DataFrame(history_records), user_entry_idx
 
 # ==========================================
-# 4. Streamlit UI
+# 4. GitHub 存檔功能
+# ==========================================
+def push_to_github(file_path, df_to_save):
+    """
+    將 DataFrame 存為 CSV 並推送到 GitHub
+    """
+    token = st.secrets.get("GITHUB_TOKEN")
+    repo_name = st.secrets.get("GITHUB_REPO")
+    
+    if not token or not repo_name:
+        return "❌ 設定缺失: 請在 Secrets 設定 GITHUB_TOKEN 與 GITHUB_REPO"
+        
+    try:
+        g = Github(token)
+        repo = g.get_repo(repo_name)
+        
+        # 轉 CSV 字串
+        csv_content = df_to_save.to_csv(index=False)
+        
+        try:
+            # 嘗試讀取舊檔 -> 更新 (Update)
+            contents = repo.get_contents(file_path)
+            repo.update_file(contents.path, f"Update {file_path} via Streamlit", csv_content, contents.sha)
+            return "✅ 雲端更新成功！"
+        except:
+            # 檔案不存在 -> 建立 (Create)
+            repo.create_file(file_path, f"Create {file_path} via Streamlit", csv_content)
+            return "✅ 雲端建立成功！"
+            
+    except Exception as e:
+        return f"❌ GitHub 推送失敗: {e}"
+
+# ==========================================
+# 5. Streamlit UI
 # ==========================================
 @st.cache_resource
 def load_models():
@@ -332,7 +357,6 @@ left, right = st.columns([1, 2.5])
 engine = DataEngine()
 models = load_models()
 
-# 檔案路徑設定
 HIST_FILE_DAY = 'history_data_day.csv'
 HIST_FILE_FULL = 'history_data_full.csv'
 
@@ -352,15 +376,14 @@ with left:
 
     st.markdown("---")
     
-    # 資料源分頁 (擴增為 5 個)
     tab_r_day, tab_h_day, tab_r_full, tab_h_full, tab_paste = st.tabs(["🌞 即時(日)", "💾 歷史(日)", "🌙 即時(全)", "💾 歷史(全)", "📝 貼上"])
     
     df_final = pd.DataFrame()
-    current_mode = 'day' # 用來標記當前是哪個分頁觸發的計算，影響顯示標題
+    current_mode = 'day'
     
     # 1. 即時串接 (日)
     with tab_r_day:
-        st.caption("日盤模式：自動濾除夜盤，指標延續昨日收盤。")
+        st.caption("日盤模式：濾除夜盤，指標延續。")
         if st.button("🔄 更新日盤資料", type="primary", key="btn_real_day"):
             current_mode = 'day'
             with st.spinner("抓取並計算中..."):
@@ -370,41 +393,62 @@ with left:
                 df_real = engine.fetch_realtime_from_anue()
                 
                 if not df_real.empty:
-                    df_concat = pd.concat([df_hist, df_real]).drop_duplicates(subset='Time').sort_values('Time')
+                    df_concat = pd.concat([df_hist, df_real]).drop_duplicates(subset='Time', keep='last').sort_values('Time')
                     df_day = engine.filter_day_session(df_concat)
                     df_final = engine.calculate_indicators(df_day, mode='day')
                     
-                    # 只留今天
                     today_str = datetime.now().strftime('%Y-%m-%d')
                     df_final = df_final[df_final['Time'].dt.strftime('%Y-%m-%d') == today_str]
                     
-                    if df_final.empty: st.warning("抓到資料但非今日日盤。")
-                    else: st.success(f"日盤更新成功！({len(df_final)} 筆)")
+                    if df_final.empty: st.warning("非今日日盤時段")
+                    else: st.success(f"日盤更新成功 ({len(df_final)}筆)")
                 else: st.error("連線失敗")
+        
+        # 指標驗證
+        if not df_final.empty:
+            with st.expander("🕵️‍♀️ 指標驗證"):
+                verify_df = df_final[['Time', 'Close', 'K', 'D', 'MA_Slope', 'Time_Segment', 'Settlement_Day']].copy()
+                verify_df['Time'] = verify_df['Time'].dt.strftime('%H:%M')
+                st.dataframe(verify_df.iloc[::-1], height=200)
 
     # 2. 歷史管理 (日)
     with tab_h_day:
-        st.caption("上傳「純日盤」歷史檔")
-        up_day = st.file_uploader("上傳 history_data_day.csv", type=['csv'], key="up_day")
+        st.caption("管理日盤歷史資料庫")
+        up_day = st.file_uploader("上傳覆蓋", type=['csv'], key="up_day")
         if up_day:
             pd.read_csv(up_day).to_csv(HIST_FILE_DAY, index=False)
-            st.success("日盤歷史檔已更新")
-        if st.button("💾 存檔 (併入今日日盤)", key="save_day"):
-            if not df_final.empty and current_mode == 'day':
+            st.success("已上傳")
+        
+        if st.button("🔄 合併今日並存檔", key="save_day"):
+            df_hist = pd.read_csv(HIST_FILE_DAY) if os.path.exists(HIST_FILE_DAY) else pd.DataFrame()
+            if not df_hist.empty: df_hist['Time'] = pd.to_datetime(df_hist['Time'])
+            
+            df_real = engine.fetch_realtime_from_anue()
+            if not df_real.empty:
+                df_concat = pd.concat([df_hist, df_real]).drop_duplicates(subset='Time', keep='last').sort_values('Time')
+                df_day_raw = engine.filter_day_session(df_concat)
                 save_cols = ['Time', 'Open', 'High', 'Low', 'Close', 'Volume']
-                if os.path.exists(HIST_FILE_DAY):
-                    df_old = pd.read_csv(HIST_FILE_DAY)[save_cols]
-                    df_new = pd.concat([df_old, df_final[save_cols]])
-                    df_new.drop_duplicates(subset='Time').to_csv(HIST_FILE_DAY, index=False)
+                df_to_save = df_day_raw[save_cols]
+                
+                # 本地存檔
+                df_to_save.to_csv(HIST_FILE_DAY, index=False)
+                
+                # 下載按鈕
+                st.download_button("📥 下載 CSV", df_to_save.to_csv(index=False), "history_day.csv", "text/csv")
+                
+                # 雲端存檔 (如果有點數)
+                if "GITHUB_TOKEN" in st.secrets:
+                    if st.button("☁️ 寫入 GitHub (Beta)"):
+                        msg = push_to_github(HIST_FILE_DAY, df_to_save)
+                        st.info(msg)
                 else:
-                    df_final[save_cols].to_csv(HIST_FILE_DAY, index=False)
-                st.success("存檔成功")
+                    st.info("💡 設定 Secrets 可啟用雲端存檔")
             else:
-                st.warning("無資料可存 (請先執行即時更新)")
+                st.error("無法抓取今日資料")
 
     # 3. 即時串接 (全)
     with tab_r_full:
-        st.caption("全盤模式：包含夜盤，參考用 (時段=1, 結算=0)。")
+        st.caption("全盤模式：包含夜盤，參考用。")
         if st.button("🔄 更新全盤資料", key="btn_real_full"):
             current_mode = 'full'
             with st.spinner("抓取中..."):
@@ -414,38 +458,40 @@ with left:
                 df_real = engine.fetch_realtime_from_anue()
                 
                 if not df_real.empty:
-                    # 全盤模式不濾除夜盤，直接拼接
-                    df_concat = pd.concat([df_hist, df_real]).drop_duplicates(subset='Time').sort_values('Time')
-                    
-                    # 計算指標 (mode='full')
+                    df_concat = pd.concat([df_hist, df_real]).drop_duplicates(subset='Time', keep='last').sort_values('Time')
                     df_final = engine.calculate_indicators(df_concat, mode='full')
-                    
-                    # 顯示最近 100 筆 (因為全盤跨日長，顯示太多會亂)
                     df_final = df_final.tail(100)
-                    
-                    if df_final.empty: st.warning("無資料")
-                    else: st.success(f"全盤更新成功！({len(df_final)} 筆)")
+                    st.success("全盤更新成功")
                 else: st.error("連線失敗")
 
     # 4. 歷史管理 (全)
     with tab_h_full:
-        st.caption("上傳「全盤」歷史檔")
-        up_full = st.file_uploader("上傳 history_data_full.csv", type=['csv'], key="up_full")
+        st.caption("管理全盤歷史資料庫")
+        up_full = st.file_uploader("上傳覆蓋", type=['csv'], key="up_full")
         if up_full:
             pd.read_csv(up_full).to_csv(HIST_FILE_FULL, index=False)
-            st.success("全盤歷史檔已更新")
-        if st.button("💾 存檔 (併入今日全盤)", key="save_full"):
-            if not df_final.empty and current_mode == 'full':
+            st.success("已上傳")
+            
+        if st.button("🔄 合併今日並存檔", key="save_full"):
+            df_hist = pd.read_csv(HIST_FILE_FULL) if os.path.exists(HIST_FILE_FULL) else pd.DataFrame()
+            if not df_hist.empty: df_hist['Time'] = pd.to_datetime(df_hist['Time'])
+            
+            df_real = engine.fetch_realtime_from_anue()
+            if not df_real.empty:
+                df_concat = pd.concat([df_hist, df_real]).drop_duplicates(subset='Time', keep='last').sort_values('Time')
                 save_cols = ['Time', 'Open', 'High', 'Low', 'Close', 'Volume']
-                if os.path.exists(HIST_FILE_FULL):
-                    df_old = pd.read_csv(HIST_FILE_FULL)[save_cols]
-                    df_new = pd.concat([df_old, df_final[save_cols]])
-                    df_new.drop_duplicates(subset='Time').to_csv(HIST_FILE_FULL, index=False)
-                else:
-                    df_final[save_cols].to_csv(HIST_FILE_FULL, index=False)
-                st.success("全盤存檔成功")
+                df_to_save = df_concat[save_cols]
+                
+                df_to_save.to_csv(HIST_FILE_FULL, index=False)
+                
+                st.download_button("📥 下載 CSV", df_to_save.to_csv(index=False), "history_full.csv", "text/csv")
+                
+                if "GITHUB_TOKEN" in st.secrets:
+                    if st.button("☁️ 寫入 GitHub", key="btn_gh_full"):
+                        msg = push_to_github(HIST_FILE_FULL, df_to_save)
+                        st.info(msg)
             else:
-                st.warning("無資料可存")
+                st.error("無法抓取資料")
 
     # 5. 貼上 (保留)
     with tab_paste:
@@ -457,9 +503,7 @@ with right:
         strat = StrategyEngine(models, {'entry': p_entry, 'exit': p_exit, 'stop': p_stop}, df_final)
         df_view, entry_idx = strat.run_analysis(u_pos, u_time)
         
-        mode_title = "🌞 日盤" if current_mode == 'day' else "🌙 全盤"
-        st.subheader(f"📜 {mode_title}訊號回放")
-        
+        st.subheader("📜 歷史訊號回放")
         df_show = df_view.iloc[::-1]
         
         st.dataframe(
@@ -471,14 +515,13 @@ with right:
                 "Strategy_Action": st.column_config.TextColumn("模型策略", width="small"),
                 "Strategy_Detail": st.column_config.TextColumn("策略細節", width="medium"),
                 "User_Advice": st.column_config.TextColumn("持單建議", width="small"),
-                "User_Note": st.column_config.TextColumn("持單細節", width="medium"),
-                "K": None, "D": None, "MA_Slope": None, "Time_Segment": None, "Settlement_Day": None 
+                "User_Note": st.column_config.TextColumn("持單細節", width="medium")
             },
             use_container_width=True,
             hide_index=True
         )
         
-        st.subheader(f"📊 {mode_title}走勢圖")
+        st.subheader("📊 當日走勢圖")
         df_chart = df_final.copy()
         df_chart['Time_Str'] = df_chart['Time'].dt.strftime('%H:%M')
         
