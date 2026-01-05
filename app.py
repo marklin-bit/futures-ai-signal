@@ -419,7 +419,7 @@ with left:
             pd.read_csv(up_day).to_csv(HIST_FILE_DAY, index=False)
             st.success("已上傳")
         
-        if st.button("🔄 合併今日並存檔", key="save_day"):
+        if st.button("☁️ 合併今日並寫入 GitHub", key="save_day"):
             df_hist = pd.read_csv(HIST_FILE_DAY) if os.path.exists(HIST_FILE_DAY) else pd.DataFrame()
             if not df_hist.empty: df_hist['Time'] = pd.to_datetime(df_hist['Time'])
             
@@ -433,16 +433,15 @@ with left:
                 # 本地存檔
                 df_to_save.to_csv(HIST_FILE_DAY, index=False)
                 
-                # 下載按鈕
-                st.download_button("📥 下載 CSV", df_to_save.to_csv(index=False), "history_day.csv", "text/csv")
-                
-                # 雲端存檔 (如果有點數)
                 if "GITHUB_TOKEN" in st.secrets:
-                    if st.button("☁️ 寫入 GitHub (Beta)"):
+                    with st.spinner("正在推送到 GitHub..."):
                         msg = push_to_github(HIST_FILE_DAY, df_to_save)
-                        st.info(msg)
+                        st.success(f"{msg}")
+                        st.info(f"檔案已儲存至 GitHub Repository 的根目錄: `{HIST_FILE_DAY}`")
+                        st.write("最後 5 筆寫入資料:")
+                        st.dataframe(df_to_save.tail(5))
                 else:
-                    st.info("💡 設定 Secrets 可啟用雲端存檔")
+                    st.error("尚未設定 GITHUB_TOKEN，無法寫入。")
             else:
                 st.error("無法抓取今日資料")
 
@@ -472,7 +471,7 @@ with left:
             pd.read_csv(up_full).to_csv(HIST_FILE_FULL, index=False)
             st.success("已上傳")
             
-        if st.button("🔄 合併今日並存檔", key="save_full"):
+        if st.button("☁️ 合併今日並寫入 GitHub", key="save_full"):
             df_hist = pd.read_csv(HIST_FILE_FULL) if os.path.exists(HIST_FILE_FULL) else pd.DataFrame()
             if not df_hist.empty: df_hist['Time'] = pd.to_datetime(df_hist['Time'])
             
@@ -484,12 +483,15 @@ with left:
                 
                 df_to_save.to_csv(HIST_FILE_FULL, index=False)
                 
-                st.download_button("📥 下載 CSV", df_to_save.to_csv(index=False), "history_full.csv", "text/csv")
-                
                 if "GITHUB_TOKEN" in st.secrets:
-                    if st.button("☁️ 寫入 GitHub", key="btn_gh_full"):
+                    with st.spinner("正在推送到 GitHub..."):
                         msg = push_to_github(HIST_FILE_FULL, df_to_save)
-                        st.info(msg)
+                        st.success(f"{msg}")
+                        st.info(f"檔案已儲存至 GitHub Repository 的根目錄: `{HIST_FILE_FULL}`")
+                        st.write("最後 5 筆寫入資料:")
+                        st.dataframe(df_to_save.tail(5))
+                else:
+                    st.error("尚未設定 GITHUB_TOKEN，無法寫入。")
             else:
                 st.error("無法抓取資料")
 
@@ -515,7 +517,8 @@ with right:
                 "Strategy_Action": st.column_config.TextColumn("模型策略", width="small"),
                 "Strategy_Detail": st.column_config.TextColumn("策略細節", width="medium"),
                 "User_Advice": st.column_config.TextColumn("持單建議", width="small"),
-                "User_Note": st.column_config.TextColumn("持單細節", width="medium")
+                "User_Note": st.column_config.TextColumn("持單細節", width="medium"),
+                "K": None, "D": None, "MA_Slope": None, "Time_Segment": None, "Settlement_Day": None 
             },
             use_container_width=True,
             hide_index=True
