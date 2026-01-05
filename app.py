@@ -465,4 +465,54 @@ if not st.session_state.df_view.empty and models:
         st.warning(f"⚠️ 資料筆數 ({len(st.session_state.df_view)}) 不足，技術指標可能偏差。")
 
     strat = StrategyEngine(models, {'entry': p_entry, 'exit': p_exit, 'stop': p_stop}, st.session_state.df_view)
-    df_display, entry_idx = strat.run_analysis(u_pos,
+    df_display, entry_idx = strat.run_analysis(u_pos, u_time)
+    
+    df_chart = df_display.copy()
+    df_chart['Time_Str'] = df_chart['Time'].dt.strftime('%H:%M')
+    total_len = len(df_chart)
+    default_range_start = max(0, total_len - 150)
+    
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df_chart['Time_Str'], y=df_chart['UB'], mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
+    fig.add_trace(go.Scatter(x=df_chart['Time_Str'], y=df_chart['LB'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(173, 216, 230, 0.2)', name='BB'))
+    fig.add_trace(go.Scatter(x=df_chart['Time_Str'], y=df_chart['Close'], mode='lines', name='Price', line=dict(color='#1f77b4', width=2)))
+    
+    for action, symbol, color, name in [('買進', 'triangle-up', 'red', 'Buy'), ('放空', 'triangle-down', 'green', 'Sell'), ('出', 'x', 'gray', 'Exit')]:
+        mask = df_chart['Strategy_Action'].str.contains(action)
+        if mask.any():
+            subset = df_chart[mask]
+            fig.add_trace(go.Scatter(x=subset['Time'].dt.strftime('%H:%M'), y=subset['Close'], mode='markers', marker=dict(symbol=symbol, size=12, color=color), name=name))
+
+    if entry_idx != -1 and entry_idx in df_chart.index:
+        row = df_chart.loc[entry_idx]
+        fig.add_trace(go.Scatter(x=[row['Time_Str']], y=[row['Close']], mode='markers', marker=dict(symbol='star', size=18, color='gold', line=dict(width=1, color='black')), name='My Entry'))
+
+    fig.update_layout(
+        height=500, margin=dict(t=30, l=0, r=0, b=0),
+        xaxis=dict(type='category', rangeslider=dict(visible=True), range=[default_range_start, total_len-1]),
+        legend=dict(orientation="h", y=1.02, x=1, xanchor="right"),
+        hovermode="x unified"
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    
+    st.subheader("📜 訊號履歷")
+    st.dataframe(
+        df_display.iloc[::-1],
+        height=400,
+        column_config={
+            "Time": st.column_config.DatetimeColumn("時間", format="MM-dd HH:mm", width="small"),
+            "Close": st.column_config.NumberColumn("價位", format="%d", width="small"),
+            "Strategy_Action": st.column_config.TextColumn("策略", width="small"),
+            "Strategy_Detail": st.column_config.TextColumn("多空機率", width="medium"),
+            "User_Advice": st.column_config.TextColumn("建議", width="small"),
+            "User_Note": st.column_config.TextColumn("持倉損益", width="medium"),
+            "UB": None, "LB": None
+        },
+        use_container_width=True,
+        hide_index=True
+    )
+    
+elif models is None:
+    st.warning("⚠️ 請確認 models/ 資料夾內是否有 4 個 .pkl 模型檔")
+else:
+    st.info("👈 請點擊左側「🌞 更新日盤」或「🌙 更新全盤」")
