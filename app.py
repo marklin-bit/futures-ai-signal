@@ -44,8 +44,7 @@ class DataEngine:
         url = "https://ws.api.cnyes.com/ws/api/v1/charting/history"
         to_ts = int(datetime.now().timestamp())
         
-        # [Modify] 抓取量調回 300 (足夠涵蓋今日日盤 + 昨日夜盤)
-        # 依靠使用者上傳的 history.csv 來提供足夠的計算基底
+        # 抓取最近 300 筆 (足夠涵蓋今日日盤 + 昨日夜盤)
         params = {"symbol": symbol, "resolution": "5", "to": to_ts, "limit": 300}
         headers = {
             "User-Agent": "Mozilla/5.0",
@@ -79,9 +78,10 @@ class DataEngine:
         df_day = df.between_time(dt_time(8, 50), dt_time(13, 45)).reset_index()
         return df_day
 
-    def calculate_indicators(self, df):
+    def calculate_indicators(self, df, mode='day'):
         """
         依照使用者指定的公式計算 13 個特徵
+        mode: 'day' (日盤模式) 或 'full' (全盤模式)
         """
         if df.empty: return df
         df = df.sort_values('Time').reset_index(drop=True)
@@ -100,32 +100,25 @@ class DataEngine:
         
         df['Bandwidth'] = ub - lb
         
-        # 2. MA斜率 (MA_Slope): 正值1, 負值-1, 0為0
-        # 邏輯: 當前MA - 前一次MA
+        # 2. MA斜率 (MA_Slope)
         ma_diff = ma20.diff()
         df['MA_Slope'] = np.sign(ma_diff).fillna(0) 
         
-        # 3. 布林頻寬變化率 (Bandwidth_Rate)
-        # (當前BW - 前一次BW) / 前一次BW
+        # 3. 布林頻寬變化率
         df['Bandwidth_Rate'] = df['Bandwidth'].pct_change()
         
-        # 4. 相對成交量 (Rel_Volume) = V / 5MA_V
+        # 4. 相對成交量
         vol_ma5 = V.rolling(5).mean()
         df['Rel_Volume'] = V / vol_ma5
         
-        # 5 & 6. KD (36, 3) - 手動計算
-        # [Checked] 移除 *100，讓數值維持在 0~1 (符合訓練資料格式)
+        # 5 & 6. KD (36, 3)
         rsv_window = 36
         l_min = L.rolling(rsv_window).min()
         h_max = H.rolling(rsv_window).max()
         rsv = (C - l_min) / (h_max - l_min) # 0.0 ~ 1.0
         
-        # EMA Smoothing for K and D (alpha=1/3)
-        # [Modify] 初始值設為 0.5 (對應 50%)
         k_vals = [0.5] * len(df)
         d_vals = [0.5] * len(df)
-        
-        # 轉成 numpy 加速
         rsv_np = rsv.to_numpy()
         
         for i in range(1, len(df)):
@@ -142,39 +135,41 @@ class DataEngine:
         # 7. 通道位置
         df['Position_in_Channel'] = (C - lb) / (ub - lb)
         
-        # 8. 波動率: (H-L)/C * 100
+        # 8. 波動率
         df['Volatility'] = (H - L) / C * 100
         
-        # 9. K棒強度: (C-O)/O * 100
+        # 9. K棒強度
         df['K_Strength'] = (C - O) / O * 100
         
-        # 10. 實體佔比: ABS((C-O)/(H-L))
-        hl_range = (H - L).replace(0, 1) # 防除以0
+        # 10. 實體佔比
+        hl_range = (H - L).replace(0, 1)
         df['Body_Ratio'] = (C - O).abs() / hl_range
         
-        # 11. 星期 (1=Mon, ..., 5=Fri)
+        # 11. 星期
         df['Week'] = df['Time'].dt.weekday + 1
         
-        # 12. 結算日 (Settlement_Day)
-        def get_settlement(row):
-            score = 0
-            d = row['Time'].date()
-            if d.weekday() in [2, 4]: # Wed(2) or Fri(4)
-                score += 1
-            if str(d) in SETTLEMENT_DATES_2026:
-                score += 1
-            return score
+        if mode == 'full':
+            # 全盤模式：強制設定
+            df['Settlement_Day'] = 0
+            df['Time_Segment'] = 1
+        else:
+            # 日盤模式：正常計算
+            # 12. 結算日
+            def get_settlement(row):
+                score = 0
+                d = row['Time'].date()
+                if d.weekday() in [2, 4]: score += 1
+                if str(d) in SETTLEMENT_DATES_2026: score += 1
+                return score
+            df['Settlement_Day'] = df.apply(get_settlement, axis=1)
             
-        df['Settlement_Day'] = df.apply(get_settlement, axis=1)
-        
-        # 13. 時段 (Time_Segment)
-        def get_segment(t):
-            hm = t.hour * 100 + t.minute
-            if hm <= 930: return 0   # 08:50 - 09:30
-            elif hm <= 1200: return 1 # 09:35 - 12:00
-            else: return 2           # 12:05 後
-            
-        df['Time_Segment'] = df['Time'].apply(get_segment)
+            # 13. 時段
+            def get_segment(t):
+                hm = t.hour * 100 + t.minute
+                if hm <= 930: return 0
+                elif hm <= 1200: return 1
+                else: return 2
+            df['Time_Segment'] = df['Time'].apply(get_segment)
         
         return df.fillna(0)
 
@@ -205,12 +200,10 @@ class StrategyEngine:
         history_records = []
         X_all = self.df[self.processor.feature_cols]
         
-        # 使用者部位資訊
         pos_map = {"空手 (Empty)": "Empty", "多單 (Long)": "Long", "空單 (Short)": "Short"}
         u_pos = pos_map.get(user_pos_type, "Empty")
         user_entry_idx, user_cost = self.find_entry_info(entry_time_obj) if u_pos != "Empty" else (-1, 0.0)
         
-        # 策略模擬變數
         s_pos, s_price, s_idx = 0, 0.0, 0
         
         for i in range(len(self.df)):
@@ -218,13 +211,12 @@ class StrategyEngine:
             curr_close = self.df.iloc[i]['Close']
             curr_feats = X_all.iloc[[i]]
             
-            # 預測
             p_long = self.models['Long_Entry_Model'].predict_proba(curr_feats)[0][1]
             p_short = self.models['Short_Entry_Model'].predict_proba(curr_feats)[0][1]
             
             trend = f"(多:{p_long:.0%}/空:{p_short:.0%})"
             
-            # --- 1. 模型策略 (模擬) ---
+            # 1. 策略模擬
             s_action = "⚪ 觀望"
             s_detail = trend
             
@@ -256,7 +248,7 @@ class StrategyEngine:
                     else:
                         s_action, s_detail = "⏳ 續抱", f"帳{pnl:.0f}(續:{1-exit_prob:.0%})"
 
-            # --- 2. 持單建議 (真實) ---
+            # 2. 持單建議
             u_action, u_note = "-", "-"
             
             if u_pos == "Empty":
@@ -266,7 +258,7 @@ class StrategyEngine:
             elif i == user_entry_idx:
                 u_action = "🔴 多單進場" if u_pos == "Long" else "🟢 空單進場"
                 u_note = f"成本 {user_cost:.0f}"
-            else: # 持倉
+            else:
                 hold_bars = i - user_entry_idx
                 if u_pos == "Long":
                     pnl = curr_close - user_cost
@@ -274,32 +266,26 @@ class StrategyEngine:
                         u_action, u_note = "💥 停損", f"{pnl:.0f}"
                     else:
                         ep = self.models['Long_Exit_Model'].predict_proba(curr_feats[self.processor.exit_feature_cols].assign(Floating_PnL=pnl, Hold_Bars=hold_bars))[0][1]
-                        
-                        detail_exit = f"帳面{pnl:.0f}(出:{ep:.0%}{trend})"
-                        detail_hold = f"帳面{pnl:.0f}(續:{1-ep:.0%}{trend})"
-                        
+                        detail = f"帳面{pnl:.0f}(出:{ep:.0%}{trend})"
                         if ep > self.params['exit']:
-                            u_action, u_note = "❌ 出場", detail_exit
+                            u_action, u_note = "❌ 出場", detail
                         elif p_long > self.params['entry'] and p_long > p_short:
-                            u_action, u_note = "🔥 加碼", detail_hold
+                            u_action, u_note = "🔥 加碼", detail
                         else:
-                            u_action, u_note = "⏳ 續抱", detail_hold
+                            u_action, u_note = "⏳ 續抱", detail
                 elif u_pos == "Short":
                     pnl = user_cost - curr_close
                     if pnl <= -self.params['stop']:
                         u_action, u_note = "💥 停損", f"{pnl:.0f}"
                     else:
                         ep = self.models['Short_Exit_Model'].predict_proba(curr_feats[self.processor.exit_feature_cols].assign(Floating_PnL=pnl, Hold_Bars=hold_bars))[0][1]
-                        
-                        detail_exit = f"帳面{pnl:.0f}(出:{ep:.0%}{trend})"
-                        detail_hold = f"帳面{pnl:.0f}(續:{1-ep:.0%}{trend})"
-                        
+                        detail = f"帳面{pnl:.0f}(出:{ep:.0%}{trend})"
                         if ep > self.params['exit']:
-                            u_action, u_note = "❎ 出場", detail_exit
+                            u_action, u_note = "❎ 出場", detail
                         elif p_short > self.params['entry'] and p_short > p_long:
-                            u_action, u_note = "🔥 加碼", detail_hold
+                            u_action, u_note = "🔥 加碼", detail
                         else:
-                            u_action, u_note = "⏳ 續抱", detail_hold
+                            u_action, u_note = "⏳ 續抱", detail
 
             history_records.append({
                 'Time': curr_time, 'Close': curr_close,
@@ -332,7 +318,9 @@ left, right = st.columns([1, 2.5])
 engine = DataEngine()
 models = load_models()
 
-HIST_FILE = 'history_data.csv'
+# 檔案路徑設定
+HIST_FILE_DAY = 'history_data_day.csv'
+HIST_FILE_FULL = 'history_data_full.csv'
 
 with left:
     st.subheader("🛠️ 設定與資料")
@@ -350,85 +338,114 @@ with left:
 
     st.markdown("---")
     
-    # 資料源分頁
-    tab1, tab2, tab3 = st.tabs(["🚀 即時串接", "💾 歷史管理", "📝 貼上 Excel"])
+    # 資料源分頁 (擴增為 5 個)
+    tab_r_day, tab_h_day, tab_r_full, tab_h_full, tab_paste = st.tabs(["🌞 即時(日)", "💾 歷史(日)", "🌙 即時(全)", "💾 歷史(全)", "📝 貼上"])
     
     df_final = pd.DataFrame()
+    current_mode = 'day' # 用來標記當前是哪個分頁觸發的計算，影響顯示標題
     
-    with tab1:
-        st.caption("自動抓取 Anue 鉅亨網 + 讀取歷史檔")
-        if st.button("🔄 立即更新資料", type="primary"):
+    # 1. 即時串接 (日)
+    with tab_r_day:
+        st.caption("日盤模式：自動濾除夜盤，指標延續昨日收盤。")
+        if st.button("🔄 更新日盤資料", type="primary", key="btn_real_day"):
+            current_mode = 'day'
             with st.spinner("抓取並計算中..."):
-                # 1. 讀取歷史
-                df_hist = pd.DataFrame()
-                if os.path.exists(HIST_FILE):
-                    df_hist = pd.read_csv(HIST_FILE)
-                    df_hist['Time'] = pd.to_datetime(df_hist['Time'])
+                df_hist = pd.read_csv(HIST_FILE_DAY) if os.path.exists(HIST_FILE_DAY) else pd.DataFrame()
+                if not df_hist.empty: df_hist['Time'] = pd.to_datetime(df_hist['Time'])
                 
-                # 2. 抓取今日
                 df_real = engine.fetch_realtime_from_anue()
                 
                 if not df_real.empty:
-                    # 3. 合併 (History + Realtime)
-                    # [Critical] 確保即時資料接續在歷史資料之後，讓指標計算 (如 MA, KD) 延續
                     df_concat = pd.concat([df_hist, df_real]).drop_duplicates(subset='Time').sort_values('Time')
-                    
-                    # 4. 濾除夜盤
                     df_day = engine.filter_day_session(df_concat)
+                    df_final = engine.calculate_indicators(df_day, mode='day')
                     
-                    # 5. 計算指標 (這時候 KD 會基於完整的歷史資料計算，不會再是 50 了)
-                    df_final = engine.calculate_indicators(df_day)
-                    
-                    # 6. 顯示用：只取「今天」
+                    # 只留今天
                     today_str = datetime.now().strftime('%Y-%m-%d')
                     df_final = df_final[df_final['Time'].dt.strftime('%Y-%m-%d') == today_str]
                     
-                    if df_final.empty:
-                        st.warning("抓到了資料，但非今日日盤 (可能是假日或尚未開盤)。")
-                    else:
-                        st.success(f"更新成功！包含 {len(df_final)} 筆今日數據")
-                else:
-                    st.error("無法連線至鉅亨網，請檢查網路。")
-        
-        # 指標驗證區
-        if not df_final.empty:
-            with st.expander("🕵️‍♀️ 指標驗證區 (點擊展開)"):
-                st.caption("請對照 Excel 驗證以下數值是否正確:")
-                verify_df = df_final[['Time', 'Close', 'K', 'D', 'MA_Slope', 'Time_Segment', 'Settlement_Day']].copy()
-                verify_df['Time'] = verify_df['Time'].dt.strftime('%H:%M')
-                st.dataframe(verify_df.iloc[::-1], height=200)
+                    if df_final.empty: st.warning("抓到資料但非今日日盤。")
+                    else: st.success(f"日盤更新成功！({len(df_final)} 筆)")
+                else: st.error("連線失敗")
 
-    with tab2:
-        st.caption("請上傳「前一日以前」的日盤資料 CSV")
-        up_file = st.file_uploader("上傳歷史檔 (覆蓋)", type=['csv'])
-        if up_file:
-            pd.read_csv(up_file).to_csv(HIST_FILE, index=False)
-            st.success("歷史檔已更新！")
-            
-        if st.button("💾 收盤存檔"):
-            if not df_final.empty:
+    # 2. 歷史管理 (日)
+    with tab_h_day:
+        st.caption("上傳「純日盤」歷史檔")
+        up_day = st.file_uploader("上傳 history_data_day.csv", type=['csv'], key="up_day")
+        if up_day:
+            pd.read_csv(up_day).to_csv(HIST_FILE_DAY, index=False)
+            st.success("日盤歷史檔已更新")
+        if st.button("💾 存檔 (併入今日日盤)", key="save_day"):
+            if not df_final.empty and current_mode == 'day':
                 save_cols = ['Time', 'Open', 'High', 'Low', 'Close', 'Volume']
-                if os.path.exists(HIST_FILE):
-                    df_old = pd.read_csv(HIST_FILE)[save_cols]
+                if os.path.exists(HIST_FILE_DAY):
+                    df_old = pd.read_csv(HIST_FILE_DAY)[save_cols]
                     df_new = pd.concat([df_old, df_final[save_cols]])
-                    df_new.drop_duplicates(subset='Time').to_csv(HIST_FILE, index=False)
+                    df_new.drop_duplicates(subset='Time').to_csv(HIST_FILE_DAY, index=False)
                 else:
-                    df_final[save_cols].to_csv(HIST_FILE, index=False)
-                st.success("已將今日資料併入歷史庫！")
+                    df_final[save_cols].to_csv(HIST_FILE_DAY, index=False)
+                st.success("存檔成功")
             else:
-                st.warning("無今日資料可存")
+                st.warning("無資料可存 (請先執行即時更新)")
 
-    with tab3:
+    # 3. 即時串接 (全)
+    with tab_r_full:
+        st.caption("全盤模式：包含夜盤，參考用 (時段=1, 結算=0)。")
+        if st.button("🔄 更新全盤資料", key="btn_real_full"):
+            current_mode = 'full'
+            with st.spinner("抓取中..."):
+                df_hist = pd.read_csv(HIST_FILE_FULL) if os.path.exists(HIST_FILE_FULL) else pd.DataFrame()
+                if not df_hist.empty: df_hist['Time'] = pd.to_datetime(df_hist['Time'])
+                
+                df_real = engine.fetch_realtime_from_anue()
+                
+                if not df_real.empty:
+                    # 全盤模式不濾除夜盤，直接拼接
+                    df_concat = pd.concat([df_hist, df_real]).drop_duplicates(subset='Time').sort_values('Time')
+                    
+                    # 計算指標 (mode='full')
+                    df_final = engine.calculate_indicators(df_concat, mode='full')
+                    
+                    # 顯示最近 100 筆 (因為全盤跨日長，顯示太多會亂)
+                    df_final = df_final.tail(100)
+                    
+                    if df_final.empty: st.warning("無資料")
+                    else: st.success(f"全盤更新成功！({len(df_final)} 筆)")
+                else: st.error("連線失敗")
+
+    # 4. 歷史管理 (全)
+    with tab_h_full:
+        st.caption("上傳「全盤」歷史檔")
+        up_full = st.file_uploader("上傳 history_data_full.csv", type=['csv'], key="up_full")
+        if up_full:
+            pd.read_csv(up_full).to_csv(HIST_FILE_FULL, index=False)
+            st.success("全盤歷史檔已更新")
+        if st.button("💾 存檔 (併入今日全盤)", key="save_full"):
+            if not df_final.empty and current_mode == 'full':
+                save_cols = ['Time', 'Open', 'High', 'Low', 'Close', 'Volume']
+                if os.path.exists(HIST_FILE_FULL):
+                    df_old = pd.read_csv(HIST_FILE_FULL)[save_cols]
+                    df_new = pd.concat([df_old, df_final[save_cols]])
+                    df_new.drop_duplicates(subset='Time').to_csv(HIST_FILE_FULL, index=False)
+                else:
+                    df_final[save_cols].to_csv(HIST_FILE_FULL, index=False)
+                st.success("全盤存檔成功")
+            else:
+                st.warning("無資料可存")
+
+    # 5. 貼上 (保留)
+    with tab_paste:
         paste_data = st.text_area("Ctrl+V 貼上", height=150)
-        if paste_data:
-            st.info("請使用即時串接功能，或將貼上資料整合至 Processor")
+        if paste_data: st.info("建議使用自動串接")
 
 with right:
     if models and not df_final.empty:
         strat = StrategyEngine(models, {'entry': p_entry, 'exit': p_exit, 'stop': p_stop}, df_final)
         df_view, entry_idx = strat.run_analysis(u_pos, u_time)
         
-        st.subheader("📜 歷史訊號回放")
+        mode_title = "🌞 日盤" if current_mode == 'day' else "🌙 全盤"
+        st.subheader(f"📜 {mode_title}訊號回放")
+        
         df_show = df_view.iloc[::-1]
         
         st.dataframe(
@@ -447,7 +464,7 @@ with right:
             hide_index=True
         )
         
-        st.subheader("📊 當日走勢圖")
+        st.subheader(f"📊 {mode_title}走勢圖")
         df_chart = df_final.copy()
         df_chart['Time_Str'] = df_chart['Time'].dt.strftime('%H:%M')
         
