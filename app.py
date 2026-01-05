@@ -100,14 +100,16 @@ class DataEngine:
         
         df['Bandwidth'] = ub - lb
         
-        # 2. MA斜率 (MA_Slope)
+        # 2. MA斜率 (MA_Slope): 正值1, 負值-1, 0為0
+        # 邏輯: 當前MA - 前一次MA
         ma_diff = ma20.diff()
         df['MA_Slope'] = np.sign(ma_diff).fillna(0) 
         
-        # 3. 布林頻寬變化率
+        # 3. 布林頻寬變化率 (Bandwidth_Rate)
+        # (當前BW - 前一次BW) / 前一次BW
         df['Bandwidth_Rate'] = df['Bandwidth'].pct_change()
         
-        # 4. 相對成交量
+        # 4. 相對成交量 (Rel_Volume) = V / 5MA_V
         vol_ma5 = V.rolling(5).mean()
         df['Rel_Volume'] = V / vol_ma5
         
@@ -232,7 +234,10 @@ class StrategyEngine:
                 if pnl <= -self.params['stop']:
                     s_pos, s_action, s_detail = 0, "💥 停損", f"損 {pnl:.0f}"
                 else:
-                    exit_prob = self.models['Long_Exit_Model'].predict_proba(curr_feats[self.processor.exit_feature_cols].assign(Floating_PnL=pnl, Hold_Bars=i-s_idx))[0][1]
+                    # [Fix] 先 assign 欄位，再選取 exit_feature_cols
+                    curr_feats_exit = curr_feats.assign(Floating_PnL=pnl, Hold_Bars=i-s_idx)
+                    exit_prob = self.models['Long_Exit_Model'].predict_proba(curr_feats_exit[self.processor.exit_feature_cols])[0][1]
+                    
                     if exit_prob > self.params['exit']:
                         s_pos, s_action, s_detail = 0, "❌ 多出", f"帳{pnl:.0f}(出:{exit_prob:.0%})"
                     else:
@@ -242,7 +247,10 @@ class StrategyEngine:
                 if pnl <= -self.params['stop']:
                     s_pos, s_action, s_detail = 0, "💥 停損", f"損 {pnl:.0f}"
                 else:
-                    exit_prob = self.models['Short_Exit_Model'].predict_proba(curr_feats[self.processor.exit_feature_cols].assign(Floating_PnL=pnl, Hold_Bars=i-s_idx))[0][1]
+                    # [Fix] 先 assign 欄位，再選取 exit_feature_cols
+                    curr_feats_exit = curr_feats.assign(Floating_PnL=pnl, Hold_Bars=i-s_idx)
+                    exit_prob = self.models['Short_Exit_Model'].predict_proba(curr_feats_exit[self.processor.exit_feature_cols])[0][1]
+                    
                     if exit_prob > self.params['exit']:
                         s_pos, s_action, s_detail = 0, "❎ 空出", f"帳{pnl:.0f}(出:{exit_prob:.0%})"
                     else:
@@ -265,7 +273,10 @@ class StrategyEngine:
                     if pnl <= -self.params['stop']:
                         u_action, u_note = "💥 停損", f"{pnl:.0f}"
                     else:
-                        ep = self.models['Long_Exit_Model'].predict_proba(curr_feats[self.processor.exit_feature_cols].assign(Floating_PnL=pnl, Hold_Bars=hold_bars))[0][1]
+                        # [Fix] 先 assign 欄位，再選取 exit_feature_cols
+                        curr_feats_exit = curr_feats.assign(Floating_PnL=pnl, Hold_Bars=hold_bars)
+                        ep = self.models['Long_Exit_Model'].predict_proba(curr_feats_exit[self.processor.exit_feature_cols])[0][1]
+                        
                         detail = f"帳面{pnl:.0f}(出:{ep:.0%}{trend})"
                         if ep > self.params['exit']:
                             u_action, u_note = "❌ 出場", detail
@@ -278,7 +289,10 @@ class StrategyEngine:
                     if pnl <= -self.params['stop']:
                         u_action, u_note = "💥 停損", f"{pnl:.0f}"
                     else:
-                        ep = self.models['Short_Exit_Model'].predict_proba(curr_feats[self.processor.exit_feature_cols].assign(Floating_PnL=pnl, Hold_Bars=hold_bars))[0][1]
+                        # [Fix] 先 assign 欄位，再選取 exit_feature_cols
+                        curr_feats_exit = curr_feats.assign(Floating_PnL=pnl, Hold_Bars=hold_bars)
+                        ep = self.models['Short_Exit_Model'].predict_proba(curr_feats_exit[self.processor.exit_feature_cols])[0][1]
+                        
                         detail = f"帳面{pnl:.0f}(出:{ep:.0%}{trend})"
                         if ep > self.params['exit']:
                             u_action, u_note = "❎ 出場", detail
