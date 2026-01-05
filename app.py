@@ -50,8 +50,11 @@ SETTLEMENT_DATES_2026 = {
     '2026-07-15', '2026-08-19', '2026-09-16', '2026-10-21', '2026-11-18', '2026-12-16'
 }
 
-MASTER_HIST_FILE = 'history_data_full.csv' 
+# 定義兩個獨立的資料庫檔案
+HIST_FILE_DAY = 'history_data_day.csv'   # 純日盤資料庫
+HIST_FILE_FULL = 'history_data_full.csv' # 全盤資料庫
 
+# Session State 初始化
 if 'df_view' not in st.session_state: st.session_state.df_view = pd.DataFrame()
 if 'entry_idx' not in st.session_state: st.session_state.entry_idx = -1
 if 'current_mode' not in st.session_state: st.session_state.current_mode = None 
@@ -137,17 +140,12 @@ class DataEngine:
 
         # 4. [新增] 自動清理：只保留最近 5 個交易日的資料
         if not full_df.empty:
-            # 取得所有唯一的日期 (年月日)
             unique_dates = full_df['Time'].dt.date.unique()
             unique_dates.sort()
             
-            # 如果超過 5 天，找出倒數第 5 天的日期
             if len(unique_dates) > 5:
                 cutoff_date = unique_dates[-5]
-                # 只保留 cutoff_date 之後 (含) 的資料
-                # 這裡用 >= 來保留這 5 天
                 full_df = full_df[full_df['Time'].dt.date >= cutoff_date]
-                # st.toast(f"已自動清理過期資料，保留 {cutoff_date} 之後的紀錄", icon="🧹")
 
         # 5. 存檔
         if not full_df.empty:
@@ -163,6 +161,7 @@ class DataEngine:
         return full_df
 
     def calculate_indicators(self, df, mode='day'):
+        """計算技術指標"""
         if df.empty: return df
         df = df.sort_values('Time').reset_index(drop=True)
         
@@ -395,42 +394,51 @@ def process_data(mode):
     # 2. 抓取 API 新資料 (鉅亨網)
     api_df = engine.fetch_anue_raw()
     
+    # 3. 讀取與合併
+    # [Fix] 即使 API 無資料，若有歷史檔，也應視為成功
+    final_df = engine.merge_and_save(api_df, hist_file, is_day_mode=(mode=='day'))
+    
+    if final_df.empty:
+        return pd.DataFrame(), "無資料 (API 失敗且無歷史檔)"
+        
+    # 如果是日盤模式，但 API 沒給東西 (表示收盤了)，要特別標示
+    status = "OK"
     if api_df.empty:
-        # 如果 API 沒資料，嘗試只讀取歷史檔
-        if os.path.exists(hist_file):
-            final_df = pd.read_csv(hist_file)
-            final_df['Time'] = pd.to_datetime(final_df['Time'])
-            st.session_state.data_range_info = f"API 無資料，僅顯示歷史存檔"
-        else:
-            return pd.DataFrame(), "無資料 (API 失敗且無歷史檔)"
-    else:
-        # 3. 合併、過濾、清理過期 (保留5天)、存檔
-        # 注意: merge_and_save 裡面會負責日盤過濾 & 自動清理
-        final_df = engine.merge_and_save(api_df, hist_file, is_day_mode=(mode=='day'))
+        status = "⚠️ API 無新資料，僅顯示歷史存檔 (可能已收盤)"
     
     # 4. 計算指標
     # (此時 final_df 已經是乾淨且長度適中的日盤或全盤資料)
     df_calc = engine.calculate_indicators(final_df, mode=mode)
     
-    return df_calc, "OK"
+    return df_calc, status
 
 if trigger_day:
     with st.spinner("整合日盤數據中..."):
         df_res, status = process_data('day')
-        if status == "OK" and not df_res.empty:
+        
+        if not df_res.empty:
+            # 即使 status 有警告，只要有資料我們就顯示
             st.session_state.df_view = df_res
             st.session_state.current_mode = 'day'
             st.session_state.last_update = datetime.now()
-        else: st.error(status)
+            
+            # 如果不是 OK，就 toast 警告一下
+            if status != "OK":
+                st.toast(status, icon="⚠️")
+        else:
+            st.error(status)
 
 if trigger_full:
     with st.spinner("整合全盤數據中..."):
         df_res, status = process_data('full')
-        if status == "OK" and not df_res.empty:
+        if not df_res.empty:
             st.session_state.df_view = df_res
             st.session_state.current_mode = 'full'
             st.session_state.last_update = datetime.now()
-        else: st.error(status)
+            if status != "OK":
+                st.toast(status, icon="⚠️")
+        else:
+            st.error(status)
 
 if not st.session_state.df_view.empty and models:
     mode_name = "🌞 日盤" if st.session_state.current_mode == 'day' else "🌙 全盤"
