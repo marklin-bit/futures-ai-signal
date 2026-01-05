@@ -56,7 +56,7 @@ if 'df_view' not in st.session_state: st.session_state.df_view = pd.DataFrame()
 if 'entry_idx' not in st.session_state: st.session_state.entry_idx = -1
 if 'current_mode' not in st.session_state: st.session_state.current_mode = None 
 if 'last_update' not in st.session_state: st.session_state.last_update = None
-if 'data_source_note' not in st.session_state: st.session_state.data_source_note = ""
+if 'data_range_info' not in st.session_state: st.session_state.data_range_info = ""
 
 # ==========================================
 # 2. 核心功能: 資料抓取與計算
@@ -70,81 +70,99 @@ class DataEngine:
         ]
         self.exit_feature_cols = self.feature_cols + ['Floating_PnL', 'Hold_Bars']
 
-    def fetch_yahoo_futures(self):
-        """
-        單一資料源：Yahoo 奇摩股市 (WTX& - 台指期連續)
-        優點：包含完整的日盤與夜盤資料，無需拼接。
-        """
-        # URL 編碼注意: symbols=["WTX&"] -> %5B%22WTX%26%22%5D
-        # range=5d: 抓取近 5 天，確保跨過週末與國定假日也能有足夠資料算指標
-        url = "https://tw.stock.yahoo.com/_td-stock/api/resource/FinanceChartService.ApacLibraCharts;symbols=%5B%22WTX%26%22%5D;type=K;range=5d;period=5m"
+    def _parse_anue_response(self, data):
+        """解析鉅亨網 API"""
+        if not data.get('t'): return pd.DataFrame()
+        df = pd.DataFrame({
+            'Time': pd.to_datetime(data['t'], unit='s'),
+            'Open': data['o'], 'High': data['h'], 'Low': data['l'], 'Close': data['c'], 'Volume': data['v']
+        })
+        # UTC -> Taiwan -> +5min (K棒結束時間)
+        df['Time'] = df['Time'].dt.tz_localize('UTC').dt.tz_convert('Asia/Taipei').dt.tz_localize(None)
+        df['Time'] = df['Time'] + timedelta(minutes=5)
+        df[['Open', 'High', 'Low', 'Close', 'Volume']] = df[['Open', 'High', 'Low', 'Close', 'Volume']].apply(pd.to_numeric, errors='coerce')
+        return df
+
+    def fetch_anue_raw(self):
+        """抓取 API 新資料"""
+        symbol = "TWF:TXF:FUTURES"
+        url = "https://ws.api.cnyes.com/ws/api/v1/charting/history"
+        headers = {"User-Agent": "Mozilla/5.0", "Referer": f"https://stock.cnyes.com/market/{symbol}"}
         
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "Referer": "https://tw.stock.yahoo.com/future/WTX&/technical-analysis"
-        }
-        
-        df_final = pd.DataFrame()
-        source_note = "Yahoo 奇摩股市 (WTX&)"
+        to_ts = int(datetime.now().timestamp())
+        params = {"symbol": symbol, "resolution": "5", "to": to_ts, "limit": 1000}
         
         try:
-            res = requests.get(url, headers=headers, timeout=10)
-            if res.status_code != 200:
-                st.error(f"Yahoo API 連線失敗 (Code: {res.status_code})")
-                return pd.DataFrame()
-            
-            data = res.json()
-            
-            # 解析 JSON 結構
-            chart = None
-            if isinstance(data, dict) and 'data' in data:
-                chart = data['data'][0]['chart']
-            elif isinstance(data, list) and len(data) > 0:
-                 if 'chart' in data[0]:
-                     chart = data[0]['chart']
-            
-            if chart:
-                timestamps = chart.get('timestamp')
-                indicators = chart.get('indicators', {}).get('quote', [{}])[0]
-                
-                if timestamps and 'close' in indicators:
-                    df = pd.DataFrame({
-                        'Time': pd.to_datetime(timestamps, unit='s'), 
-                        'Open': indicators['open'],
-                        'High': indicators['high'],
-                        'Low': indicators['low'],
-                        'Close': indicators['close'],
-                        'Volume': indicators.get('volume', [0]*len(timestamps))
-                    })
-                    
-                    # Yahoo 時間處理: UTC -> Taiwan
-                    df['Time'] = df['Time'].dt.tz_localize('UTC').dt.tz_convert('Asia/Taipei').dt.tz_localize(None)
-                    
-                    # [時間校正]
-                    # Yahoo 給的是 K 棒「開始時間」(例如 09:00)，我們習慣看「結束時間」(09:05)
-                    df['Time'] = df['Time'] + timedelta(minutes=5)
-                    
-                    # 簡單檢查資料有效性 (濾掉尚未開盤的空值)
-                    df = df.dropna(subset=['Close'])
-                    df_final = df
-            
-            st.session_state.data_source_note = source_note
-            return df_final
-
+            res = requests.get(url, params=params, headers=headers, timeout=8)
+            data = res.json().get('data', {})
+            if data.get('t'):
+                return self._parse_anue_response(data)
         except Exception as e:
-            st.error(f"API Error: {e}")
-            return pd.DataFrame()
+            st.error(f"鉅亨網連線錯誤: {e}")
+        
+        return pd.DataFrame()
 
-    def filter_day_session(self, df):
-        if df.empty: return df
-        df = df.set_index('Time').sort_index()
-        # 寬鬆過濾 (確保包含 08:50 的第一根 與 13:45 的最後一根)
-        return df.between_time(dt_time(8, 45), dt_time(13, 50)).reset_index()
+    def merge_and_save(self, api_df, hist_file, is_day_mode=False):
+        """
+        [增強版] 合併、過濾、存檔、並自動清理過期資料 (只留最近 5 個交易日)
+        """
+        # 1. 讀取歷史
+        if os.path.exists(hist_file):
+            try:
+                hist_df = pd.read_csv(hist_file)
+                hist_df['Time'] = pd.to_datetime(hist_df['Time'])
+            except:
+                hist_df = pd.DataFrame()
+        else:
+            hist_df = pd.DataFrame()
+
+        # 2. 處理新資料
+        new_df = api_df.copy()
+        if not new_df.empty and is_day_mode:
+            # 日盤模式過濾
+            new_df = new_df.set_index('Time').sort_index()
+            new_df = new_df.between_time(dt_time(8, 45), dt_time(13, 45)).reset_index()
+
+        # 3. 合併
+        if not new_df.empty:
+            if not hist_df.empty:
+                full_df = pd.concat([hist_df, new_df])
+            else:
+                full_df = new_df
+            
+            # 去重排序
+            full_df = full_df.drop_duplicates(subset='Time', keep='last').sort_values('Time').reset_index(drop=True)
+        else:
+            full_df = hist_df
+
+        # 4. [新增] 自動清理：只保留最近 5 個交易日的資料
+        if not full_df.empty:
+            # 取得所有唯一的日期 (年月日)
+            unique_dates = full_df['Time'].dt.date.unique()
+            unique_dates.sort()
+            
+            # 如果超過 5 天，找出倒數第 5 天的日期
+            if len(unique_dates) > 5:
+                cutoff_date = unique_dates[-5]
+                # 只保留 cutoff_date 之後 (含) 的資料
+                # 這裡用 >= 來保留這 5 天
+                full_df = full_df[full_df['Time'].dt.date >= cutoff_date]
+                # st.toast(f"已自動清理過期資料，保留 {cutoff_date} 之後的紀錄", icon="🧹")
+
+        # 5. 存檔
+        if not full_df.empty:
+            save_cols = ['Time', 'Open', 'High', 'Low', 'Close', 'Volume']
+            full_df[save_cols].to_csv(hist_file, index=False)
+            
+            start_str = full_df['Time'].iloc[0].strftime('%Y-%m-%d %H:%M')
+            end_str = full_df['Time'].iloc[-1].strftime('%Y-%m-%d %H:%M')
+            st.session_state.data_range_info = f"{start_str} ~ {end_str} (共 {len(full_df)} 筆 / {len(unique_dates) if 'unique_dates' in locals() else '?'} 天)"
+        else:
+            st.session_state.data_range_info = "無資料"
+
+        return full_df
 
     def calculate_indicators(self, df, mode='day'):
-        """
-        在本地端計算技術指標，確保與 AI 模型訓練時的邏輯完全一致。
-        """
         if df.empty: return df
         df = df.sort_values('Time').reset_index(drop=True)
         
@@ -162,7 +180,7 @@ class DataEngine:
         df['Bandwidth_Rate'] = df['Bandwidth'].pct_change()
         df['Rel_Volume'] = V / V.rolling(5).mean()
         
-        # 3. KD (36, 3) - 使用 Pandas EWM 平滑，模擬遞迴計算
+        # 3. KD (36, 3)
         rsv = (C - L.rolling(36).min()) / (H.rolling(36).max() - L.rolling(36).min())
         df['K'] = rsv.ewm(alpha=1/3, adjust=False).mean()
         df['D'] = df['K'].ewm(alpha=1/3, adjust=False).mean()
@@ -181,12 +199,11 @@ class DataEngine:
             hm = df['Time'].dt.hour * 100 + df['Time'].dt.minute
             df['Time_Segment'] = np.select([hm <= 930, hm <= 1200], [0, 1], default=2)
         
-        # 填補 NaN (避免模型報錯)，但保留 Close/UB/LB 的 NaN 以便繪圖斷開
         df[self.feature_cols] = df[self.feature_cols].fillna(method='bfill').fillna(0)
         return df
 
 # ==========================================
-# 3. 策略引擎
+# 3. 策略引擎 (無變更)
 # ==========================================
 class StrategyEngine:
     def __init__(self, models, params, df):
@@ -332,48 +349,65 @@ with st.sidebar:
         u_pos = st.radio("真實持倉", ["空手 (Empty)", "多單 (Long)", "空單 (Short)"])
         u_time = st.time_input("進場時間", value=dt_time(9,0), step=300) if u_pos != "空手 (Empty)" else None
 
-    with st.expander("💾 資料庫管理 (Master)", expanded=False):
-        up = st.file_uploader("上傳歷史檔 (覆蓋)", type=['csv'])
-        if up:
-            pd.read_csv(up).to_csv(MASTER_HIST_FILE, index=False)
-            st.success("已更新主資料庫")
-        if st.button("☁️ 寫入 GitHub", key="save_master"):
-            if os.path.exists(MASTER_HIST_FILE):
-                st.write(push_to_github(MASTER_HIST_FILE, pd.read_csv(MASTER_HIST_FILE)))
-            else: st.error("無本地檔")
+    with st.expander("💾 資料庫管理", expanded=False):
+        st.caption("手動上傳/下載 CSV 備份")
+        
+        tab_db_day, tab_db_full = st.tabs(["日盤庫", "全盤庫"])
+        
+        # 定義兩個獨立的資料庫檔案 (與上面一致)
+        HIST_FILE_DAY = 'history_data_day.csv'
+        HIST_FILE_FULL = 'history_data_full.csv'
+
+        with tab_db_day:
+            up_day = st.file_uploader("上傳日盤歷史", type=['csv'], key="up_day")
+            if up_day:
+                pd.read_csv(up_day).to_csv(HIST_FILE_DAY, index=False)
+                st.success("已更新日盤庫")
+            if st.button("寫入 GitHub (日盤)", key="git_day"):
+                if os.path.exists(HIST_FILE_DAY):
+                    st.write(push_to_github(HIST_FILE_DAY, pd.read_csv(HIST_FILE_DAY)))
+                else: st.error("無本地檔")
+
+        with tab_db_full:
+            up_full = st.file_uploader("上傳全盤歷史", type=['csv'], key="up_full")
+            if up_full:
+                pd.read_csv(up_full).to_csv(HIST_FILE_FULL, index=False)
+                st.success("已更新全盤庫")
+            if st.button("寫入 GitHub (全盤)", key="git_full"):
+                if os.path.exists(HIST_FILE_FULL):
+                    st.write(push_to_github(HIST_FILE_FULL, pd.read_csv(HIST_FILE_FULL)))
+                else: st.error("無本地檔")
 
 def process_data(mode):
-    df_hist = pd.read_csv(MASTER_HIST_FILE) if os.path.exists(MASTER_HIST_FILE) else pd.DataFrame()
-    if not df_hist.empty: df_hist['Time'] = pd.to_datetime(df_hist['Time'])
+    # 1. 判斷要用的歷史檔
+    hist_file = HIST_FILE_DAY if mode == 'day' else HIST_FILE_FULL
     
-    # [Single Source] 統一使用 Yahoo WTX& 抓取
-    df_real = engine.fetch_yahoo_futures()
+    # 2. 抓取 API 新資料 (鉅亨網)
+    api_df = engine.fetch_anue_raw()
     
-    if not df_real.empty:
-        # 合併並去除重複
-        df_total = pd.concat([df_hist, df_real]).drop_duplicates(subset='Time', keep='last').sort_values('Time')
-        # 存檔
-        save_cols = ['Time', 'Open', 'High', 'Low', 'Close', 'Volume']
-        df_total[save_cols].to_csv(MASTER_HIST_FILE, index=False)
+    if api_df.empty:
+        # 如果 API 沒資料，嘗試只讀取歷史檔
+        if os.path.exists(hist_file):
+            final_df = pd.read_csv(hist_file)
+            final_df['Time'] = pd.to_datetime(final_df['Time'])
+            st.session_state.data_range_info = f"API 無資料，僅顯示歷史存檔"
+        else:
+            return pd.DataFrame(), "無資料 (API 失敗且無歷史檔)"
     else:
-        df_total = df_hist
-
-    if df_total.empty: return pd.DataFrame(), "無資料"
-
-    if mode == 'day':
-        df_calc = engine.filter_day_session(df_total)
-    else:
-        df_calc = df_total
-        
-    if df_calc.empty: return pd.DataFrame(), "該時段無資料 (建議先更新全盤以累積歷史)"
-
-    df_calc = engine.calculate_indicators(df_calc, mode=mode)
+        # 3. 合併、過濾、清理過期 (保留5天)、存檔
+        # 注意: merge_and_save 裡面會負責日盤過濾 & 自動清理
+        final_df = engine.merge_and_save(api_df, hist_file, is_day_mode=(mode=='day'))
+    
+    # 4. 計算指標
+    # (此時 final_df 已經是乾淨且長度適中的日盤或全盤資料)
+    df_calc = engine.calculate_indicators(final_df, mode=mode)
+    
     return df_calc, "OK"
 
 if trigger_day:
     with st.spinner("整合日盤數據中..."):
         df_res, status = process_data('day')
-        if status == "OK":
+        if status == "OK" and not df_res.empty:
             st.session_state.df_view = df_res
             st.session_state.current_mode = 'day'
             st.session_state.last_update = datetime.now()
@@ -382,7 +416,7 @@ if trigger_day:
 if trigger_full:
     with st.spinner("整合全盤數據中..."):
         df_res, status = process_data('full')
-        if status == "OK":
+        if status == "OK" and not df_res.empty:
             st.session_state.df_view = df_res
             st.session_state.current_mode = 'full'
             st.session_state.last_update = datetime.now()
@@ -392,10 +426,11 @@ if not st.session_state.df_view.empty and models:
     mode_name = "🌞 日盤" if st.session_state.current_mode == 'day' else "🌙 全盤"
     st.title(f"{mode_name}戰情室")
     
-    if st.session_state.data_source_note:
-        st.caption(f"ℹ️ 資料來源: {st.session_state.data_source_note} | 最後更新: {st.session_state.last_update.strftime('%H:%M:%S')}")
-    else:
-        st.caption(f"最後更新: {st.session_state.last_update.strftime('%H:%M:%S')}")
+    # 顯示資料庫狀態
+    if st.session_state.data_range_info:
+        st.info(f"💾 資料庫範圍 (最近 5 日): {st.session_state.data_range_info}")
+    
+    st.caption(f"最後更新: {st.session_state.last_update.strftime('%H:%M:%S')}")
     
     if len(st.session_state.df_view) < 50:
         st.warning(f"⚠️ 資料筆數 ({len(st.session_state.df_view)}) 不足，技術指標可能偏差。")
