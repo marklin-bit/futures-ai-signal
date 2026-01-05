@@ -81,7 +81,6 @@ class DataEngine:
     def calculate_indicators(self, df):
         """
         依照使用者指定的公式計算 13 個特徵
-        注意：這需要足夠的歷史資料 (History + Today) 才能算得準
         """
         if df.empty: return df
         df = df.sort_values('Time').reset_index(drop=True)
@@ -128,6 +127,7 @@ class DataEngine:
         # 轉成 numpy 加速
         rsv_np = rsv.to_numpy()
         
+        # 注意: 這裡假設歷史資料的第一筆已經有足夠長度，否則初期 KD 會從 50 開始收斂
         for i in range(1, len(df)):
             if np.isnan(rsv_np[i]): 
                 k_vals[i] = k_vals[i-1]
@@ -152,8 +152,8 @@ class DataEngine:
         hl_range = (H - L).replace(0, 1) # 防除以0
         df['Body_Ratio'] = (C - O).abs() / hl_range
         
-        # 11. 星期 (1=Mon, ..., 7=Sun) -> 訓練時好像是用 0~4 ? 
-        # Python .weekday() 是 0=Mon, 6=Sun. 這裡用 +1 對應一般認知 1~7
+        # 11. 星期 (1=Mon, ..., 5=Fri)
+        # Python .weekday(): 0=Mon, 6=Sun. 加1對應 1~7.
         df['Week'] = df['Time'].dt.weekday + 1
         
         # 12. 結算日 (Settlement_Day)
@@ -170,18 +170,15 @@ class DataEngine:
             
         df['Settlement_Day'] = df.apply(get_settlement, axis=1)
         
-        # 13. 時段 (Time_Segment)
-        # 08:45~09:30 -> 0 (盤初) [配合+5分校正: 08:50~09:35]
-        # 09:35~12:00 -> 0 (盤中) [User Prompt說0? 還是1? 前面討論是1, 這裡遵照prompt寫0]
-        # 12:05~13:30 -> 2 (盤尾)
-        # 修正: 既然 User Prompt 兩個都寫 0，我就照寫。但通常中盤是 1。
-        # 我這裡稍微調整一下邏輯以符合一般模型區隔，若您的模型真的盤初盤中都是0，請告知。
-        # 根據之前的對話，盤中是 1。我這裡暫時設 盤初=0, 盤中=1, 盤尾=2 以確保模型能區分。
+        # 13. 時段 (Time_Segment) - 依指定邏輯
+        # 08:50 ~ 09:30 -> 0 (盤初)
+        # 09:35 ~ 12:00 -> 1 (盤中)
+        # 12:05 ~ 13:30 (含收盤) -> 2 (盤尾)
         def get_segment(t):
             hm = t.hour * 100 + t.minute
-            if hm <= 935: return 0 # 盤初 (08:50 ~ 09:35)
-            elif hm >= 1205: return 2 # 盤尾
-            else: return 1 # 盤中
+            if hm <= 930: return 0   # 08:50 - 09:30
+            elif hm <= 1200: return 1 # 09:35 - 12:00
+            else: return 2           # 12:05 後
             
         df['Time_Segment'] = df['Time'].apply(get_segment)
         
@@ -283,31 +280,41 @@ class StrategyEngine:
                         u_action, u_note = "💥 停損", f"{pnl:.0f}"
                     else:
                         ep = self.models['Long_Exit_Model'].predict_proba(curr_feats[self.processor.exit_feature_cols].assign(Floating_PnL=pnl, Hold_Bars=hold_bars))[0][1]
-                        detail = f"帳面{pnl:.0f}(出:{ep:.0%}{trend})"
+                        
+                        # 格式: 帳面XX(出:XX%/多:XX%/空:XX%)
+                        detail_exit = f"帳面{pnl:.0f}(出:{ep:.0%}{trend})"
+                        detail_hold = f"帳面{pnl:.0f}(續:{1-ep:.0%}{trend})"
+                        
                         if ep > self.params['exit']:
-                            u_action, u_note = "❌ 出場", detail
+                            u_action, u_note = "❌ 出場", detail_exit
                         elif p_long > self.params['entry'] and p_long > p_short:
-                            u_action, u_note = "🔥 加碼", detail
+                            u_action, u_note = "🔥 加碼", detail_hold
                         else:
-                            u_action, u_note = "⏳ 續抱", detail
+                            u_action, u_note = "⏳ 續抱", detail_hold
                 elif u_pos == "Short":
                     pnl = user_cost - curr_close
                     if pnl <= -self.params['stop']:
                         u_action, u_note = "💥 停損", f"{pnl:.0f}"
                     else:
                         ep = self.models['Short_Exit_Model'].predict_proba(curr_feats[self.processor.exit_feature_cols].assign(Floating_PnL=pnl, Hold_Bars=hold_bars))[0][1]
-                        detail = f"帳面{pnl:.0f}(出:{ep:.0%}{trend})"
+                        
+                        detail_exit = f"帳面{pnl:.0f}(出:{ep:.0%}{trend})"
+                        detail_hold = f"帳面{pnl:.0f}(續:{1-ep:.0%}{trend})"
+                        
                         if ep > self.params['exit']:
-                            u_action, u_note = "❎ 出場", detail
+                            u_action, u_note = "❎ 出場", detail_exit
                         elif p_short > self.params['entry'] and p_short > p_long:
-                            u_action, u_note = "🔥 加碼", detail
+                            u_action, u_note = "🔥 加碼", detail_hold
                         else:
-                            u_action, u_note = "⏳ 續抱", detail
+                            u_action, u_note = "⏳ 續抱", detail_hold
 
             history_records.append({
                 'Time': curr_time, 'Close': curr_close,
                 'Strategy_Action': s_action, 'Strategy_Detail': s_detail,
-                'User_Advice': u_action, 'User_Note': u_note
+                'User_Advice': u_action, 'User_Note': u_note,
+                'K': curr_feats['K'].values[0], 'D': curr_feats['D'].values[0], 
+                'MA_Slope': curr_feats['MA_Slope'].values[0], 'Time_Segment': curr_feats['Time_Segment'].values[0],
+                'Settlement_Day': curr_feats['Settlement_Day'].values[0]
             })
             
         return pd.DataFrame(history_records), user_entry_idx
@@ -332,19 +339,16 @@ left, right = st.columns([1, 2.5])
 engine = DataEngine()
 models = load_models()
 
-# History File Path
 HIST_FILE = 'history_data.csv'
 
 with left:
     st.subheader("🛠️ 設定與資料")
     
-    # 參數
     with st.expander("⚙️ 策略參數", expanded=False):
         p_entry = st.slider("進場信心", 0.5, 0.95, 0.80, 0.05)
         p_exit = st.slider("出場機率", 0.3, 0.9, 0.50, 0.05)
         p_stop = st.number_input("硬停損", 100, step=10)
     
-    # 部位
     st.markdown("##### 👤 真實部位")
     u_pos = st.radio("持倉", ["空手 (Empty)", "多單 (Long)", "空單 (Short)"], label_visibility="collapsed")
     u_time = None
@@ -375,13 +379,13 @@ with left:
                     # 3. 合併 (History + Realtime)
                     df_concat = pd.concat([df_hist, df_real]).drop_duplicates(subset='Time').sort_values('Time')
                     
-                    # 4. 濾除夜盤 (確保只算日盤指標)
+                    # 4. 濾除夜盤
                     df_day = engine.filter_day_session(df_concat)
                     
                     # 5. 計算指標
                     df_final = engine.calculate_indicators(df_day)
                     
-                    # 6. 顯示用：只取「今天」的資料
+                    # 6. 顯示用：只取「今天」
                     today_str = datetime.now().strftime('%Y-%m-%d')
                     df_final = df_final[df_final['Time'].dt.strftime('%Y-%m-%d') == today_str]
                     
@@ -391,24 +395,24 @@ with left:
                         st.success(f"更新成功！包含 {len(df_final)} 筆今日數據")
                 else:
                     st.error("無法連線至鉅亨網，請檢查網路。")
+        
+        # [Added] 指標驗證區
+        if not df_final.empty:
+            with st.expander("🕵️‍♀️ 指標驗證區 (點擊展開)"):
+                st.caption("請對照 Excel 驗證以下數值是否正確:")
+                verify_df = df_final[['Time', 'Close', 'K', 'D', 'MA_Slope', 'Time_Segment', 'Settlement_Day']].copy()
+                verify_df['Time'] = verify_df['Time'].dt.strftime('%H:%M')
+                st.dataframe(verify_df.iloc[::-1], height=200)
 
     with tab2:
-        st.caption("請在此上傳「前一日以前」的日盤資料 CSV，作為指標計算的基底。")
+        st.caption("請上傳「前一日以前」的日盤資料 CSV")
         up_file = st.file_uploader("上傳歷史檔 (覆蓋)", type=['csv'])
         if up_file:
             pd.read_csv(up_file).to_csv(HIST_FILE, index=False)
             st.success("歷史檔已更新！")
             
-        if st.button("💾 收盤存檔 (將今日數據寫入歷史)"):
+        if st.button("💾 收盤存檔"):
             if not df_final.empty:
-                # 重新讀取歷史 + 今日 -> 存檔
-                old_hist = pd.read_csv(HIST_FILE) if os.path.exists(HIST_FILE) else pd.DataFrame()
-                # 這裡需要把 df_final (只有今天) Append 加上去
-                # 但 df_final 已經有指標了，歷史檔最好存原始 OHLCV 以免指標重複算? 
-                # 不，方便起見存原始數據最好。
-                # 這裡簡化：假設使用者要存的是「今天抓到的完整 OHLCV」
-                # 我們把 df_real (原始) 存進去比較安全。
-                # 但為了 UI 簡單，我們先存 df_final 的 OHLCV 部分
                 save_cols = ['Time', 'Open', 'High', 'Low', 'Close', 'Volume']
                 if os.path.exists(HIST_FILE):
                     df_old = pd.read_csv(HIST_FILE)[save_cols]
@@ -423,20 +427,13 @@ with left:
     with tab3:
         paste_data = st.text_area("Ctrl+V 貼上", height=150)
         if paste_data:
-            try:
-                df_pasted = pd.read_csv(io.StringIO(paste_data), sep='\t')
-                processor = DataProcessor(df_pasted) # 使用舊的 Processor 邏輯 (需補上 class)
-                # 這裡為了簡化，建議使用者這部分沿用舊邏輯，或是直接用 df_final 蓋掉
-                # 暫時略過，主攻 Tab 1
-                st.info("請使用即時串接功能")
-            except: pass
+            st.info("請使用即時串接功能，或將貼上資料整合至 Processor")
 
 with right:
     if models and not df_final.empty:
         strat = StrategyEngine(models, {'entry': p_entry, 'exit': p_exit, 'stop': p_stop}, df_final)
         df_view, entry_idx = strat.run_analysis(u_pos, u_time)
         
-        # --- A. 歷史回放 ---
         st.subheader("📜 歷史訊號回放")
         df_show = df_view.iloc[::-1]
         
@@ -449,13 +446,13 @@ with right:
                 "Strategy_Action": st.column_config.TextColumn("模型策略", width="small"),
                 "Strategy_Detail": st.column_config.TextColumn("策略細節", width="medium"),
                 "User_Advice": st.column_config.TextColumn("持單建議", width="small"),
-                "User_Note": st.column_config.TextColumn("持單細節", width="medium")
+                "User_Note": st.column_config.TextColumn("持單細節", width="medium"),
+                "K": None, "D": None, "MA_Slope": None, "Time_Segment": None, "Settlement_Day": None 
             },
             use_container_width=True,
             hide_index=True
         )
         
-        # --- B. K線圖 ---
         st.subheader("📊 當日走勢圖")
         df_chart = df_final.copy()
         df_chart['Time_Str'] = df_chart['Time'].dt.strftime('%H:%M')
@@ -463,7 +460,6 @@ with right:
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=df_chart['Time_Str'], y=df_chart['Close'], mode='lines', name='Price', line=dict(color='#1f77b4')))
         
-        # 標記
         buys = df_view[df_view['Strategy_Action'].str.contains('買進')]
         sells = df_view[df_view['Strategy_Action'].str.contains('放空')]
         exits_long = df_view[df_view['Strategy_Action'].str.contains('❌')]
@@ -474,7 +470,6 @@ with right:
         if not exits_long.empty: fig.add_trace(go.Scatter(x=exits_long['Time'].dt.strftime('%H:%M'), y=exits_long['Close'], mode='markers', marker=dict(symbol='x', size=10, color='red'), name='Exit'))
         if not exits_short.empty: fig.add_trace(go.Scatter(x=exits_short['Time'].dt.strftime('%H:%M'), y=exits_short['Close'], mode='markers', marker=dict(symbol='x', size=10, color='green'), name='Exit'))
         
-        # 真實進場
         if entry_idx != -1 and entry_idx in df_chart.index:
             entry_row = df_chart.loc[entry_idx]
             color = 'red' if u_pos == "多單 (Long)" else 'green'
