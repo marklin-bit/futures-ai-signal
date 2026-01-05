@@ -24,7 +24,7 @@ except ImportError:
 # ==========================================
 st.set_page_config(page_title="AI 交易訊號戰情室 (Pro)", layout="wide", initial_sidebar_state="expanded")
 
-# [Fix] CSS 美化：調整按鈕樣式與版面
+# [Fix] CSS 美化
 st.markdown("""
     <style>
         .block-container {
@@ -36,7 +36,6 @@ st.markdown("""
             padding-top: 2rem;
         }
         div[data-testid="stMetricValue"] {font-size: 24px;}
-        /* 讓兩列按鈕更好看 */
         .stButton button {
             width: 100%;
             border-radius: 5px;
@@ -51,13 +50,12 @@ SETTLEMENT_DATES_2026 = {
     '2026-07-15', '2026-08-19', '2026-09-16', '2026-10-21', '2026-11-18', '2026-12-16'
 }
 
-HIST_FILE_DAY = 'history_data_day.csv'
-HIST_FILE_FULL = 'history_data_full.csv'
+# [Critical Change] 統一使用全盤歷史檔作為主資料庫，避免資料分散遺失
+MASTER_HIST_FILE = 'history_data_full.csv' 
 
-# 初始化 Session State (用於記住目前的顯示狀態)
 if 'df_view' not in st.session_state: st.session_state.df_view = pd.DataFrame()
 if 'entry_idx' not in st.session_state: st.session_state.entry_idx = -1
-if 'current_mode' not in st.session_state: st.session_state.current_mode = None # 'day' or 'full'
+if 'current_mode' not in st.session_state: st.session_state.current_mode = None 
 if 'last_update' not in st.session_state: st.session_state.last_update = None
 
 # ==========================================
@@ -101,7 +99,8 @@ class DataEngine:
     def filter_day_session(self, df):
         if df.empty: return df
         df = df.set_index('Time').sort_index()
-        return df.between_time(dt_time(8, 50), dt_time(13, 45)).reset_index()
+        # [Fix] 放寬一點時間範圍，確保邊界資料有被納入
+        return df.between_time(dt_time(8, 45), dt_time(13, 50)).reset_index()
 
     def calculate_indicators(self, df, mode='day'):
         if df.empty: return df
@@ -113,16 +112,14 @@ class DataEngine:
         ma20 = C.rolling(20).mean()
         std20 = C.rolling(20).std()
         
-        # [Fix] 這裡不填 0，保留 NaN 給繪圖用
         df['UB'] = ma20 + 2 * std20
         df['LB'] = ma20 - 2 * std20
         df['Bandwidth'] = df['UB'] - df['LB']
         
-        df['MA_Slope'] = np.sign(ma20.diff()) # 這裡可以有 NaN
+        df['MA_Slope'] = np.sign(ma20.diff()) 
         df['Bandwidth_Rate'] = df['Bandwidth'].pct_change()
         df['Rel_Volume'] = V / V.rolling(5).mean()
         
-        # KD
         rsv = (C - L.rolling(36).min()) / (H.rolling(36).max() - L.rolling(36).min())
         df['K'] = rsv.ewm(alpha=1/3, adjust=False).mean()
         df['D'] = df['K'].ewm(alpha=1/3, adjust=False).mean()
@@ -141,14 +138,13 @@ class DataEngine:
             hm = df['Time'].dt.hour * 100 + df['Time'].dt.minute
             df['Time_Segment'] = np.select([hm <= 930, hm <= 1200], [0, 1], default=2)
         
-        # [Critical Fix] 只針對「模型特徵」填補 0，避免模型報錯；但保留 UB/LB/Close 為 NaN 或原值，避免圖表亂掉
-        # 使用 bfill 先補前面的 NaN，再用 0 補剩下的
+        # 針對模型特徵填補 0，但保留 UB/LB/Close 為 NaN 以利繪圖斷點
         df[self.feature_cols] = df[self.feature_cols].fillna(method='bfill').fillna(0)
         
         return df
 
 # ==========================================
-# 3. 策略引擎
+# 3. 策略引擎 (維持不變)
 # ==========================================
 class StrategyEngine:
     def __init__(self, models, params, df):
@@ -188,7 +184,6 @@ class StrategyEngine:
             trend = f"(多:{p_long:.0%}/空:{p_short:.0%})"
             s_action, s_detail = "⚪ 觀望", trend
             
-            # --- 策略訊號 ---
             if s_pos == 0:
                 if p_long > self.params['entry'] and p_long > p_short:
                     s_pos, s_price, s_idx, s_action, s_detail = 1, curr_row['Close'], i, "🔴 買進", f"多 {p_long:.0%} {trend}"
@@ -213,7 +208,6 @@ class StrategyEngine:
                     s_action, s_detail = ("❎ 空出", f"帳{pnl:.0f}(出:{ep:.0%})") if ep > self.params['exit'] else ("⏳ 續抱", f"帳{pnl:.0f}(續:{1-ep:.0%})")
                     if ep > self.params['exit']: s_pos = 0
 
-            # --- 真實部位建議 ---
             u_action, u_note = "-", "-"
             if u_pos != "Empty" and i >= user_entry_idx:
                 hold_bars = i - user_entry_idx
@@ -285,13 +279,10 @@ models = load_models()
 # --- 側邊欄 ---
 with st.sidebar:
     st.header("🎮 控制台")
-    
-    # [Fix] 按鈕分兩列，整潔排列
     col_day, col_full = st.columns(2)
     trigger_day = col_day.button("🌞 更新日盤", type="primary", use_container_width=True)
     trigger_full = col_full.button("🌙 更新全盤", use_container_width=True)
     
-    # 策略參數
     with st.expander("⚙️ 參數與部位", expanded=True):
         p_entry = st.slider("進場信心", 0.5, 0.95, 0.80, 0.05)
         p_exit = st.slider("出場機率", 0.3, 0.9, 0.50, 0.05)
@@ -300,60 +291,52 @@ with st.sidebar:
         u_pos = st.radio("真實持倉", ["空手 (Empty)", "多單 (Long)", "空單 (Short)"])
         u_time = st.time_input("進場時間", value=dt_time(9,0), step=300) if u_pos != "空手 (Empty)" else None
 
-    # 歷史資料管理 (收納起來，比較整潔)
-    with st.expander("💾 歷史資料庫管理", expanded=False):
-        tab_h_day, tab_h_full = st.tabs(["日盤歷史", "全盤歷史"])
-        
-        def handle_history(file_path, key_suffix):
-            up = st.file_uploader(f"上傳覆蓋 ({key_suffix})", type=['csv'], key=f"up_{key_suffix}")
-            if up:
-                pd.read_csv(up).to_csv(file_path, index=False)
-                st.success("已更新本地檔")
-            if st.button(f"☁️ 寫入 GitHub ({key_suffix})", key=f"save_{key_suffix}"):
-                if os.path.exists(file_path):
-                    st.write(push_to_github(file_path, pd.read_csv(file_path)))
-                else: st.error("無本地檔")
-
-        with tab_h_day: handle_history(HIST_FILE_DAY, "day")
-        with tab_h_full: handle_history(HIST_FILE_FULL, "full")
+    # 歷史資料管理 (只管理主檔案)
+    with st.expander("💾 資料庫管理 (Master)", expanded=False):
+        up = st.file_uploader("上傳歷史檔 (覆蓋)", type=['csv'])
+        if up:
+            pd.read_csv(up).to_csv(MASTER_HIST_FILE, index=False)
+            st.success("已更新主資料庫")
+        if st.button("☁️ 寫入 GitHub", key="save_master"):
+            if os.path.exists(MASTER_HIST_FILE):
+                st.write(push_to_github(MASTER_HIST_FILE, pd.read_csv(MASTER_HIST_FILE)))
+            else: st.error("無本地檔")
 
 # --- 資料處理邏輯 ---
 def process_data(mode):
-    hist_file = HIST_FILE_DAY if mode == 'day' else HIST_FILE_FULL
-    df_hist = pd.read_csv(hist_file) if os.path.exists(hist_file) else pd.DataFrame()
+    # [Critical] 無論日盤/全盤，統一讀取與寫入 MASTER_HIST_FILE
+    df_hist = pd.read_csv(MASTER_HIST_FILE) if os.path.exists(MASTER_HIST_FILE) else pd.DataFrame()
     if not df_hist.empty: df_hist['Time'] = pd.to_datetime(df_hist['Time'])
     
+    # 1. 抓取新資料 (包含日盤+夜盤)
     df_real = engine.fetch_realtime_from_anue()
     
+    # 2. 合併
     if not df_real.empty:
         df_total = pd.concat([df_hist, df_real]).drop_duplicates(subset='Time', keep='last').sort_values('Time')
+        # 3. [Critical] 立即存回主檔，確保夜盤資料被保存
+        save_cols = ['Time', 'Open', 'High', 'Low', 'Close', 'Volume']
+        df_total[save_cols].to_csv(MASTER_HIST_FILE, index=False)
     else:
         df_total = df_hist
 
     if df_total.empty: return pd.DataFrame(), "無資料"
 
+    # 4. 根據模式過濾「顯示範圍」，但不影響存檔
     if mode == 'day':
         df_calc = engine.filter_day_session(df_total)
     else:
         df_calc = df_total
         
-    # 計算指標
+    if df_calc.empty: return pd.DataFrame(), "該時段無資料 (建議先更新全盤以累積歷史)"
+
+    # 5. 計算指標
     df_calc = engine.calculate_indicators(df_calc, mode=mode)
-    
-    # 存檔邏輯: 只存原始 OHLCV 回歷史檔 (不存指標)
-    if not df_total.empty:
-        save_cols = ['Time', 'Open', 'High', 'Low', 'Close', 'Volume']
-        if mode == 'day':
-            # 日盤歷史檔只存日盤資料
-            engine.filter_day_session(df_total)[save_cols].to_csv(hist_file, index=False)
-        else:
-            df_total[save_cols].to_csv(hist_file, index=False)
-            
     return df_calc, "OK"
 
 # --- 觸發更新邏輯 ---
 if trigger_day:
-    with st.spinner("更新日盤中..."):
+    with st.spinner("整合日盤數據中..."):
         df_res, status = process_data('day')
         if status == "OK":
             st.session_state.df_view = df_res
@@ -362,7 +345,7 @@ if trigger_day:
         else: st.error(status)
 
 if trigger_full:
-    with st.spinner("更新全盤中..."):
+    with st.spinner("整合全盤數據中..."):
         df_res, status = process_data('full')
         if status == "OK":
             st.session_state.df_view = df_res
@@ -376,26 +359,24 @@ if not st.session_state.df_view.empty and models:
     st.title(f"{mode_name}戰情室")
     st.caption(f"最後更新: {st.session_state.last_update.strftime('%H:%M:%S') if st.session_state.last_update else '-'}")
     
-    # 執行策略
+    # 警告：若資料過少導致指標失效
+    if len(st.session_state.df_view) < 50:
+        st.warning(f"⚠️ 資料筆數 ({len(st.session_state.df_view)}) 不足，技術指標 (MA, KD) 可能尚未暖機完成，僅供參考。")
+
     strat = StrategyEngine(models, {'entry': p_entry, 'exit': p_exit, 'stop': p_stop}, st.session_state.df_view)
     df_display, entry_idx = strat.run_analysis(u_pos, u_time)
     
-    # [Fix] 顯示範圍設定 (避免圖表擠成一團)
-    # 取最後 150 根 K 棒來畫圖，但保留完整 DataFrame 供縮放
+    # 顯示範圍設定
     df_chart = df_display.copy()
     df_chart['Time_Str'] = df_chart['Time'].dt.strftime('%H:%M')
-    
     total_len = len(df_chart)
     default_range_start = max(0, total_len - 150)
     
-    # 繪圖
     fig = go.Figure()
-    
-    # 布林通道 (處理 NaN 不顯示的問題)
+    # 布林通道
     fig.add_trace(go.Scatter(x=df_chart['Time_Str'], y=df_chart['UB'], mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
     fig.add_trace(go.Scatter(x=df_chart['Time_Str'], y=df_chart['LB'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(173, 216, 230, 0.2)', name='BB'))
-    
-    # K線/收盤價
+    # 價格
     fig.add_trace(go.Scatter(x=df_chart['Time_Str'], y=df_chart['Close'], mode='lines', name='Price', line=dict(color='#1f77b4', width=2)))
     
     # 訊號
@@ -405,7 +386,6 @@ if not st.session_state.df_view.empty and models:
             subset = df_chart[mask]
             fig.add_trace(go.Scatter(x=subset['Time'].dt.strftime('%H:%M'), y=subset['Close'], mode='markers', marker=dict(symbol=symbol, size=12, color=color), name=name))
 
-    # 使用者進場點
     if entry_idx != -1 and entry_idx in df_chart.index:
         row = df_chart.loc[entry_idx]
         fig.add_trace(go.Scatter(x=[row['Time_Str']], y=[row['Close']], mode='markers', marker=dict(symbol='star', size=18, color='gold', line=dict(width=1, color='black')), name='My Entry'))
@@ -418,7 +398,6 @@ if not st.session_state.df_view.empty and models:
     )
     st.plotly_chart(fig, use_container_width=True)
     
-    # [Fix] 訊號履歷 (一致性優化)
     st.subheader("📜 訊號履歷")
     st.dataframe(
         df_display.iloc[::-1],
@@ -430,7 +409,7 @@ if not st.session_state.df_view.empty and models:
             "Strategy_Detail": st.column_config.TextColumn("多空機率", width="medium"),
             "User_Advice": st.column_config.TextColumn("建議", width="small"),
             "User_Note": st.column_config.TextColumn("持倉損益", width="medium"),
-            "UB": None, "LB": None # 隱藏欄位
+            "UB": None, "LB": None
         },
         use_container_width=True,
         hide_index=True
@@ -439,4 +418,4 @@ if not st.session_state.df_view.empty and models:
 elif models is None:
     st.warning("⚠️ 請確認 models/ 資料夾內是否有 4 個 .pkl 模型檔")
 else:
-    st.info("👈 請點擊左側「🌞 更新日盤」或「🌙 更新全盤」開始分析")
+    st.info("👈 請點擊左側「🌞 更新日盤」或「🌙 更新全盤」")
