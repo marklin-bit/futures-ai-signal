@@ -22,39 +22,53 @@ except ImportError:
 # ==========================================
 # 1. 網頁設定與全域參數
 # ==========================================
-st.set_page_config(page_title="AI 交易訊號戰情室 (Pro)", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(
+    page_title="AI 交易訊號戰情室 (Pro)", 
+    layout="wide", 
+    initial_sidebar_state="expanded",
+    page_icon="📈"
+)
 
 # CSS 美化
 st.markdown("""
     <style>
         .block-container {
-            padding-top: 2rem !important; 
-            padding-bottom: 5rem;
+            padding-top: 1.5rem !important; 
+            padding-bottom: 3rem;
             max-width: 98% !important;
         }
-        section[data-testid="stSidebar"] .block-container {
-            padding-top: 2rem;
+        div[data-testid="stMetricValue"] {
+            font-size: 20px;
+            font-weight: bold;
         }
-        div[data-testid="stMetricValue"] {font-size: 24px;}
         .stButton button {
             width: 100%;
-            border-radius: 5px;
-            font-weight: bold;
+            border-radius: 8px;
+            font-weight: 600;
+        }
+        div[data-testid="stDataFrame"] {
+            font-family: 'Consolas', 'Monaco', monospace;
         }
     </style>
 """, unsafe_allow_html=True)
 
-# 2026 年月結算日清單
-SETTLEMENT_DATES_2026 = {
+# ------------------------------------------------------------------
+# [重要] 結算日設定
+# ------------------------------------------------------------------
+SETTLEMENT_DATES = {
+    # 2025
+    '2025-01-15', '2025-02-19', '2025-03-19', '2025-04-16', '2025-05-21', '2025-06-18',
+    '2025-07-16', '2025-08-20', '2025-09-17', '2025-10-15', '2025-11-19', '2025-12-17',
+    # 2026
     '2026-01-21', '2026-02-18', '2026-03-18', '2026-04-15', '2026-05-20', '2026-06-17',
     '2026-07-15', '2026-08-19', '2026-09-16', '2026-10-21', '2026-11-18', '2026-12-16'
 }
 
-# 定義兩個獨立的資料庫檔案
-HIST_FILE_DAY = 'history_data_day.csv'   # 純日盤資料庫
-HIST_FILE_FULL = 'history_data_full.csv' # 全盤資料庫
+# 資料庫路徑
+HIST_FILE_DAY = 'history_data_day.csv'
+HIST_FILE_FULL = 'history_data_full.csv'
 
-# Session State 初始化
+# Session State
 if 'df_view' not in st.session_state: st.session_state.df_view = pd.DataFrame()
 if 'entry_idx' not in st.session_state: st.session_state.entry_idx = -1
 if 'current_mode' not in st.session_state: st.session_state.current_mode = None 
@@ -74,123 +88,130 @@ class DataEngine:
         self.exit_feature_cols = self.feature_cols + ['Floating_PnL', 'Hold_Bars']
 
     def _parse_anue_response(self, data):
-        """解析鉅亨網 API"""
         if not data.get('t'): return pd.DataFrame()
-        df = pd.DataFrame({
-            'Time': pd.to_datetime(data['t'], unit='s'),
-            'Open': data['o'], 'High': data['h'], 'Low': data['l'], 'Close': data['c'], 'Volume': data['v']
-        })
-        # UTC -> Taiwan -> +5min (K棒結束時間)
-        df['Time'] = df['Time'].dt.tz_localize('UTC').dt.tz_convert('Asia/Taipei').dt.tz_localize(None)
-        df['Time'] = df['Time'] + timedelta(minutes=5)
-        df[['Open', 'High', 'Low', 'Close', 'Volume']] = df[['Open', 'High', 'Low', 'Close', 'Volume']].apply(pd.to_numeric, errors='coerce')
-        return df
+        try:
+            df = pd.DataFrame({
+                'Time': pd.to_datetime(data['t'], unit='s'),
+                'Open': data['o'], 'High': data['h'], 'Low': data['l'], 'Close': data['c'], 'Volume': data['v']
+            })
+            df['Time'] = df['Time'].dt.tz_localize('UTC').dt.tz_convert('Asia/Taipei').dt.tz_localize(None)
+            df['Time'] = df['Time'] + timedelta(minutes=5)
+            
+            cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+            df[cols] = df[cols].apply(pd.to_numeric, errors='coerce')
+            df = df.dropna(subset=cols)
+            return df
+        except Exception as e:
+            st.warning(f"資料解析異常: {e}")
+            return pd.DataFrame()
 
     def fetch_anue_raw(self):
-        """抓取 API 新資料"""
         symbol = "TWF:TXF:FUTURES"
         url = "https://ws.api.cnyes.com/ws/api/v1/charting/history"
         headers = {"User-Agent": "Mozilla/5.0", "Referer": f"https://stock.cnyes.com/market/{symbol}"}
         
         to_ts = int(datetime.now().timestamp())
-        # 抓取 1000 筆 (約 3-4 天)
         params = {"symbol": symbol, "resolution": "5", "to": to_ts, "limit": 1000}
         
         try:
             res = requests.get(url, params=params, headers=headers, timeout=8)
-            data = res.json().get('data', {})
-            if data.get('t'):
+            if res.status_code == 200:
+                data = res.json().get('data', {})
                 return self._parse_anue_response(data)
         except Exception as e:
             st.error(f"鉅亨網連線錯誤: {e}")
-        
         return pd.DataFrame()
 
     def merge_and_save(self, api_df, hist_file, is_day_mode=False):
-        """
-        [增強版] 合併、過濾、存檔、並自動清理過期資料 (只留最近 5 個交易日)
-        """
-        # 1. 讀取歷史
+        # 讀取歷史資料
+        hist_df = pd.DataFrame()
         if os.path.exists(hist_file):
             try:
                 hist_df = pd.read_csv(hist_file)
                 hist_df['Time'] = pd.to_datetime(hist_df['Time'])
-            except:
-                hist_df = pd.DataFrame()
-        else:
-            hist_df = pd.DataFrame()
+            except: pass
 
-        # 2. 處理新資料
+        # 過濾新 API 資料
         new_df = api_df.copy()
         if not new_df.empty and is_day_mode:
-            # 日盤模式：嚴格過濾，只保留 08:45 ~ 13:45 的資料
             new_df = new_df.set_index('Time').sort_index()
             new_df = new_df.between_time(dt_time(8, 45), dt_time(13, 45)).reset_index()
 
-        # 3. 合併與去重
+        # 合併邏輯 (確保歷史連續性)
         if not new_df.empty:
             if not hist_df.empty:
                 full_df = pd.concat([hist_df, new_df])
             else:
                 full_df = new_df
             
-            # 依時間去重，保留最新的數據
-            full_df = full_df.drop_duplicates(subset='Time', keep='last').sort_values('Time').reset_index(drop=True)
+            # 重要：合併後先排序，確保時間序列正確，這對後續計算至關重要
+            full_df = full_df.sort_values('Time')
+            full_df = full_df.drop_duplicates(subset='Time', keep='last').reset_index(drop=True)
         else:
             full_df = hist_df
 
-        # 確保日盤歷史檔不含雜質
+        # 日盤再次過濾雜訊
         if is_day_mode and not full_df.empty:
              full_df = full_df.set_index('Time').sort_index()
              full_df = full_df.between_time(dt_time(8, 45), dt_time(13, 45)).reset_index()
 
-        # 4. 自動清理：只保留最近 5 個交易日
+        # 自動清理：只保留最近 5 個交易日
         if not full_df.empty:
-            unique_dates = full_df['Time'].dt.date.unique()
-            unique_dates.sort()
-            
+            full_df['Date'] = full_df['Time'].dt.date
+            unique_dates = sorted(full_df['Date'].unique())
             if len(unique_dates) > 5:
                 cutoff_date = unique_dates[-5]
-                full_df = full_df[full_df['Time'].dt.date >= cutoff_date]
+                full_df = full_df[full_df['Date'] >= cutoff_date]
+            full_df = full_df.drop(columns=['Date'])
 
-        # 5. 存檔
+        # 存檔
         if not full_df.empty:
-            save_cols = ['Time', 'Open', 'High', 'Low', 'Close', 'Volume']
-            full_df[save_cols].to_csv(hist_file, index=False)
+            full_df[['Time', 'Open', 'High', 'Low', 'Close', 'Volume']].to_csv(hist_file, index=False)
             
-            start_str = full_df['Time'].iloc[0].strftime('%Y-%m-%d %H:%M')
-            end_str = full_df['Time'].iloc[-1].strftime('%Y-%m-%d %H:%M')
-            st.session_state.data_range_info = f"{start_str} ~ {end_str} (共 {len(full_df)} 筆 / {len(unique_dates) if 'unique_dates' in locals() else '?'} 天)"
+            start = full_df['Time'].iloc[0].strftime('%m/%d %H:%M')
+            end = full_df['Time'].iloc[-1].strftime('%m/%d %H:%M')
+            days = len(unique_dates) if 'unique_dates' in locals() else '?'
+            st.session_state.data_range_info = f"{start} ~ {end} (共 {len(full_df)} K / {days} 天)"
         else:
-            st.session_state.data_range_info = "無資料"
+            st.session_state.data_range_info = "尚無資料"
 
         return full_df
 
     def calculate_indicators(self, df, mode='day'):
-        """計算技術指標"""
+        """計算技術指標 (確保無未來數據汙染)"""
         if df.empty: return df
+        df = df.copy()
+        
+        # 確保時間序列由舊到新排列，這對 Rolling 計算是必須的
         df = df.sort_values('Time').reset_index(drop=True)
         
         C = df['Close']; H = df['High']; L = df['Low']; O = df['Open']; V = df['Volume']
         
-        # 1. 布林通道 (20, 2)
+        # 指標計算
+        # 這裡會用到前面的歷史資料。只要 df 裡包含昨天的資料，今天的 MA 就不會是 NaN
         ma20 = C.rolling(20).mean()
         std20 = C.rolling(20).std()
         df['UB'] = ma20 + 2 * std20
         df['LB'] = ma20 - 2 * std20
         df['Bandwidth'] = df['UB'] - df['LB']
         
-        # 2. 其他特徵
         df['MA_Slope'] = np.sign(ma20.diff()) 
         df['Bandwidth_Rate'] = df['Bandwidth'].pct_change()
-        df['Rel_Volume'] = V / V.rolling(5).mean()
         
-        # 3. KD (36, 3)
-        rsv = (C - L.rolling(36).min()) / (H.rolling(36).max() - L.rolling(36).min())
+        vol_ma = V.rolling(5).mean().replace(0, 1)
+        df['Rel_Volume'] = V / vol_ma
+        
+        lowest_l = L.rolling(36).min()
+        highest_h = H.rolling(36).max()
+        denom = (highest_h - lowest_l).replace(0, 1)
+        rsv = (C - lowest_l) / denom
+        
         df['K'] = rsv.ewm(alpha=1/3, adjust=False).mean()
         df['D'] = df['K'].ewm(alpha=1/3, adjust=False).mean()
         
-        df['Position_in_Channel'] = (C - df['LB']) / df['Bandwidth']
+        bw_safe = df['Bandwidth'].replace(0, 0.0001)
+        df['Position_in_Channel'] = (C - df['LB']) / bw_safe
+        
         df['Volatility'] = (H - L) / C * 100
         df['K_Strength'] = (C - O) / O * 100
         df['Body_Ratio'] = (C - O).abs() / (H - L).replace(0, 1)
@@ -200,15 +221,23 @@ class DataEngine:
             df['Settlement_Day'] = 0
             df['Time_Segment'] = 1
         else:
-            df['Settlement_Day'] = df['Time'].apply(lambda t: 1 if (t.weekday() in [2,4] or str(t.date()) in SETTLEMENT_DATES_2026) else 0)
+            df['Settlement_Day'] = df['Time'].apply(
+                lambda t: 1 if (t.weekday() in [2,4] or str(t.date()) in SETTLEMENT_DATES) else 0
+            )
             hm = df['Time'].dt.hour * 100 + df['Time'].dt.minute
             df['Time_Segment'] = np.select([hm <= 930, hm <= 1200], [0, 1], default=2)
         
-        df[self.feature_cols] = df[self.feature_cols].fillna(method='bfill').fillna(0)
+        # [邏輯確認]
+        # 使用 fillna(0) 是為了處理「資料集最開頭」的 NaN (5天前的資料)。
+        # 因為我們在計算前已經載入了完整的歷史資料 (df 包含 5 天)，
+        # 所以「今天 08:45」的資料前面已經有「昨天」的資料做支撐，
+        # 計算出來的 MA, KD 等指標會是有效值，不會變成 0。
+        # 這樣既避免了「偷看未來 (bfill)」，也確保了「今日計算連續性」。
+        df[self.feature_cols] = df[self.feature_cols].fillna(0)
         return df
 
 # ==========================================
-# 3. 策略引擎 (無變更)
+# 3. 策略引擎
 # ==========================================
 class StrategyEngine:
     def __init__(self, models, params, df):
@@ -226,52 +255,95 @@ class StrategyEngine:
         return -1, 0.0
 
     def run_analysis(self, user_pos_type, entry_time_obj):
-        if self.df.empty: return pd.DataFrame(), {}
+        """
+        執行策略分析
+        邏輯說明：
+        1. Batch Prediction (批次預測) 是為了加速。
+        2. 因為 Tree Model 是 Stateless (無狀態) 的，Model.predict(Row_N) 的結果
+           只取決於 Row_N 的特徵。
+        3. Row_N 的特徵 (如 MA20) 在 DataEngine 階段已經計算完成，
+           其數值僅包含 Row_0 到 Row_N 的歷史資訊。
+        4. 因此，一次算完所有機率，與迴圈中逐筆計算，數學結果完全相同，且無未來視問題。
+        """
+        if self.df.empty: return pd.DataFrame(), -1
         
-        history_records = []
         X_all = self.df[self.processor.feature_cols]
+        
+        # --- Step 1: 批次預測 (快速算出每根 K 棒的原始訊號) ---
+        try:
+            # 這裡計算出來的 probs_long[i] 代表：
+            # 在第 i 根 K 棒結束當下 (包含了 0~i 的歷史特徵)，AI 對未來的判斷
+            probs_long = self.models['Long_Entry_Model'].predict_proba(X_all)[:, 1]
+            probs_short = self.models['Short_Entry_Model'].predict_proba(X_all)[:, 1]
+        except:
+            probs_long = np.zeros(len(self.df))
+            probs_short = np.zeros(len(self.df))
+
+        # --- Step 2: 準備使用者持倉資訊 ---
         pos_map = {"空手 (Empty)": "Empty", "多單 (Long)": "Long", "空單 (Short)": "Short"}
         u_pos = pos_map.get(user_pos_type, "Empty")
         user_entry_idx, user_cost = self.find_entry_info(entry_time_obj) if u_pos != "Empty" else (-1, 0.0)
         
-        s_pos, s_price, s_idx = 0, 0.0, 0
+        # --- Step 3: 策略狀態機迴圈 (模擬時間推演) ---
+        history_records = []
         
+        s_pos = 0     # 策略持倉
+        s_price = 0.0 # 進場價
+        s_idx = 0     # 進場Index
+        
+        # 逐筆模擬，確保每一筆交易決策都只基於當下或過去的狀態
         for i in range(len(self.df)):
             curr_row = self.df.iloc[i]
-            curr_feats = X_all.iloc[[i]]
             
-            try:
-                p_long = self.models['Long_Entry_Model'].predict_proba(curr_feats)[0][1]
-                p_short = self.models['Short_Entry_Model'].predict_proba(curr_feats)[0][1]
-            except: p_long, p_short = 0.0, 0.0
+            # 取出當下時間點 AI 的判斷 (這個機率值只包含 <= i 時間點的資訊)
+            p_long = probs_long[i]
+            p_short = probs_short[i]
             
-            trend = f"(多:{p_long:.0%}/空:{p_short:.0%})"
-            s_action, s_detail = "⚪ 觀望", trend
+            trend_str = f"(多:{p_long:.0%}/空:{p_short:.0%})"
+            s_action, s_detail = "⚪ 觀望", trend_str
             
+            # 策略進出場邏輯 (狀態機)
             if s_pos == 0:
                 if p_long > self.params['entry'] and p_long > p_short:
-                    s_pos, s_price, s_idx, s_action, s_detail = 1, curr_row['Close'], i, "🔴 買進", f"多 {p_long:.0%} {trend}"
+                    s_pos = 1; s_price = curr_row['Close']; s_idx = i
+                    s_action = "🔴 買進"; s_detail = f"多 {p_long:.0%} {trend_str}"
                 elif p_short > self.params['entry'] and p_short > p_long:
-                    s_pos, s_price, s_idx, s_action, s_detail = -1, curr_row['Close'], i, "🟢 放空", f"空 {p_short:.0%} {trend}"
-            elif s_pos == 1:
+                    s_pos = -1; s_price = curr_row['Close']; s_idx = i
+                    s_action = "🟢 放空"; s_detail = f"空 {p_short:.0%} {trend_str}"
+            
+            elif s_pos == 1: # 持有多單
                 pnl = curr_row['Close'] - s_price
                 if pnl <= -self.params['stop']:
-                    s_pos, s_action, s_detail = 0, "💥 停損", f"損 {pnl:.0f}"
+                    s_pos = 0; s_action = "💥 停損"; s_detail = f"損 {pnl:.0f}"
                 else:
-                    curr_feats_exit = curr_feats.assign(Floating_PnL=pnl, Hold_Bars=i-s_idx)
-                    ep = self.models['Long_Exit_Model'].predict_proba(curr_feats_exit[self.processor.exit_feature_cols])[0][1]
-                    s_action, s_detail = ("❌ 多出", f"帳{pnl:.0f}(出:{ep:.0%})") if ep > self.params['exit'] else ("⏳ 續抱", f"帳{pnl:.0f}(續:{1-ep:.0%})")
-                    if ep > self.params['exit']: s_pos = 0
-            elif s_pos == -1:
+                    # 出場特徵需要包含當下的 PnL，所以這裡需即時組建特徵
+                    # 這邊只針對單筆資料預測，也不會偷看未來
+                    row_feats = X_all.iloc[[i]].copy()
+                    row_feats['Floating_PnL'] = pnl
+                    row_feats['Hold_Bars'] = i - s_idx
+                    ep = self.models['Long_Exit_Model'].predict_proba(row_feats[self.processor.exit_feature_cols])[0][1]
+                    
+                    if ep > self.params['exit']:
+                        s_pos = 0; s_action = "❌ 多出"; s_detail = f"帳{pnl:.0f}(出:{ep:.0%})"
+                    else:
+                        s_action = "⏳ 續抱"; s_detail = f"帳{pnl:.0f}(續:{1-ep:.0%})"
+
+            elif s_pos == -1: # 持有空單
                 pnl = s_price - curr_row['Close']
                 if pnl <= -self.params['stop']:
-                    s_pos, s_action, s_detail = 0, "💥 停損", f"損 {pnl:.0f}"
+                    s_pos = 0; s_action = "💥 停損"; s_detail = f"損 {pnl:.0f}"
                 else:
-                    curr_feats_exit = curr_feats.assign(Floating_PnL=pnl, Hold_Bars=i-s_idx)
-                    ep = self.models['Short_Exit_Model'].predict_proba(curr_feats_exit[self.processor.exit_feature_cols])[0][1]
-                    s_action, s_detail = ("❎ 空出", f"帳{pnl:.0f}(出:{ep:.0%})") if ep > self.params['exit'] else ("⏳ 續抱", f"帳{pnl:.0f}(續:{1-ep:.0%})")
-                    if ep > self.params['exit']: s_pos = 0
+                    row_feats = X_all.iloc[[i]].copy()
+                    row_feats['Floating_PnL'] = pnl
+                    row_feats['Hold_Bars'] = i - s_idx
+                    ep = self.models['Short_Exit_Model'].predict_proba(row_feats[self.processor.exit_feature_cols])[0][1]
+                    
+                    if ep > self.params['exit']:
+                        s_pos = 0; s_action = "❎ 空出"; s_detail = f"帳{pnl:.0f}(出:{ep:.0%})"
+                    else:
+                        s_action = "⏳ 續抱"; s_detail = f"帳{pnl:.0f}(續:{1-ep:.0%})"
 
+            # 真實持倉建議 (User Advice) - 邏輯同上，略為精簡
             u_action, u_note = "-", "-"
             if u_pos != "Empty" and i >= user_entry_idx:
                 hold_bars = i - user_entry_idx
@@ -280,8 +352,9 @@ class StrategyEngine:
                     if i == user_entry_idx: u_action, u_note = "🔴 多單進場", f"本 {user_cost:.0f}"
                     elif pnl <= -self.params['stop']: u_action, u_note = "💥 停損", f"{pnl:.0f}"
                     else:
-                        curr_feats_exit = curr_feats.assign(Floating_PnL=pnl, Hold_Bars=hold_bars)
-                        ep = self.models['Long_Exit_Model'].predict_proba(curr_feats_exit[self.processor.exit_feature_cols])[0][1]
+                        row_feats = X_all.iloc[[i]].copy()
+                        row_feats['Floating_PnL'] = pnl; row_feats['Hold_Bars'] = hold_bars
+                        ep = self.models['Long_Exit_Model'].predict_proba(row_feats[self.processor.exit_feature_cols])[0][1]
                         u_action = "❌ 出場" if ep > self.params['exit'] else ("🔥 加碼" if p_long > self.params['entry'] else "⏳ 續抱")
                         u_note = f"帳{pnl:.0f}(出:{ep:.0%})"
                 elif u_pos == "Short":
@@ -289,8 +362,9 @@ class StrategyEngine:
                     if i == user_entry_idx: u_action, u_note = "🟢 空單進場", f"本 {user_cost:.0f}"
                     elif pnl <= -self.params['stop']: u_action, u_note = "💥 停損", f"{pnl:.0f}"
                     else:
-                        curr_feats_exit = curr_feats.assign(Floating_PnL=pnl, Hold_Bars=hold_bars)
-                        ep = self.models['Short_Exit_Model'].predict_proba(curr_feats_exit[self.processor.exit_feature_cols])[0][1]
+                        row_feats = X_all.iloc[[i]].copy()
+                        row_feats['Floating_PnL'] = pnl; row_feats['Hold_Bars'] = hold_bars
+                        ep = self.models['Short_Exit_Model'].predict_proba(row_feats[self.processor.exit_feature_cols])[0][1]
                         u_action = "❎ 出場" if ep > self.params['exit'] else ("🔥 加碼" if p_short > self.params['entry'] else "⏳ 續抱")
                         u_note = f"帳{pnl:.0f}(出:{ep:.0%})"
 
@@ -309,19 +383,12 @@ class StrategyEngine:
 def push_to_github(file_path, df_to_save):
     token = st.secrets.get("GITHUB_TOKEN")
     repo_name = st.secrets.get("GITHUB_REPO")
-    
-    if not token or not repo_name:
-        return "❌ 缺少 GitHub 設定"
-    
-    # Repo 格式檢查
-    if "/" not in repo_name:
-        return f"❌ Repo 名稱錯誤: '{repo_name}'。請務必使用 'username/repo_name' 格式！"
+    if not token or not repo_name: return "❌ 缺少 GitHub 設定"
+    if "/" not in repo_name: return f"❌ Repo 名稱錯誤: '{repo_name}'"
 
     try:
         g = Github(token)
-        # 這裡會觸發 404 如果 Token 權限不夠或 Repo 不存在
         repo = g.get_repo(repo_name)
-        
         csv_content = df_to_save.to_csv(index=False)
         try:
             contents = repo.get_contents(file_path)
@@ -330,32 +397,27 @@ def push_to_github(file_path, df_to_save):
         except:
             repo.create_file(file_path, f"Create {file_path}", csv_content)
             return "✅ 雲端建立成功！"
-    except Exception as e:
-        # [Fix] 更詳細的錯誤提示
-        err_msg = str(e)
-        if "404" in err_msg and "Not Found" in err_msg:
-            return (
-                f"❌ GitHub 回傳 404 錯誤 (找不到 Repo)。請檢查：\n"
-                f"1. Token 是否已勾選 'repo' (Full control) 權限？(私有庫必須)\n"
-                f"2. Repo 名稱 '{repo_name}' 是否完全正確？\n"
-                f"3. 該 Repo 是否真的存在？"
-            )
-        return f"❌ GitHub 推送失敗: {e}"
+    except GithubException as e:
+        if e.status == 404: return "❌ 404 錯誤 (Repo 不存在或無權限)"
+        return f"❌ GitHub 錯誤: {e.data.get('message', str(e))}"
+    except Exception as e: return f"❌ 未知錯誤: {str(e)}"
 
 # ==========================================
 # 5. UI 主程式
 # ==========================================
 @st.cache_resource
 def load_models():
-    try:
-        models = {}
-        for name in ['Long_Entry_Model', 'Short_Entry_Model', 'Long_Exit_Model', 'Short_Exit_Model']:
-            if os.path.exists(f"models/{name}.pkl"): models[name] = joblib.load(f"models/{name}.pkl")
-            elif os.path.exists(f"{name}.pkl"): models[name] = joblib.load(f"{name}.pkl")
-        return models if len(models)==4 else None
-    except: return None
+    models = {}
+    req = ['Long_Entry_Model', 'Short_Entry_Model', 'Long_Exit_Model', 'Short_Exit_Model']
+    missing = []
+    for name in req:
+        p1, p2 = f"models/{name}.pkl", f"{name}.pkl"
+        if os.path.exists(p1): models[name] = joblib.load(p1)
+        elif os.path.exists(p2): models[name] = joblib.load(p2)
+        else: missing.append(name)
+    if missing: st.error(f"❌ 缺少模型: {missing}"); return None
+    return models
 
-# 自動刷新
 if st_autorefresh: st_autorefresh(interval=300000, key="auto_refresh")
 
 engine = DataEngine()
@@ -367,152 +429,99 @@ with st.sidebar:
     trigger_day = col_day.button("🌞 更新日盤", type="primary", use_container_width=True)
     trigger_full = col_full.button("🌙 更新全盤", use_container_width=True)
     
+    if st.button("🧹 重置資料庫"):
+        if os.path.exists(HIST_FILE_DAY): os.remove(HIST_FILE_DAY)
+        if os.path.exists(HIST_FILE_FULL): os.remove(HIST_FILE_FULL)
+        st.cache_data.clear()
+        st.session_state.df_view = pd.DataFrame()
+        st.rerun()
+
     with st.expander("⚙️ 參數與部位", expanded=True):
         p_entry = st.slider("進場信心", 0.5, 0.95, 0.80, 0.05)
         p_exit = st.slider("出場機率", 0.3, 0.9, 0.50, 0.05)
-        p_stop = st.number_input("硬停損", 100, step=10)
+        p_stop = st.number_input("硬停損", 50, 500, 100, step=10)
         st.markdown("---")
         u_pos = st.radio("真實持倉", ["空手 (Empty)", "多單 (Long)", "空單 (Short)"])
         u_time = st.time_input("進場時間", value=dt_time(9,0), step=300) if u_pos != "空手 (Empty)" else None
 
     with st.expander("💾 資料庫管理", expanded=False):
-        st.caption("手動上傳/下載 CSV 備份")
-        
-        tab_db_day, tab_db_full = st.tabs(["日盤庫", "全盤庫"])
-        
-        with tab_db_day:
-            up_day = st.file_uploader("上傳日盤歷史", type=['csv'], key="up_day")
-            if up_day:
-                pd.read_csv(up_day).to_csv(HIST_FILE_DAY, index=False)
-                st.success("已更新日盤庫")
-            if st.button("寫入 GitHub (日盤)", key="git_day"):
-                if os.path.exists(HIST_FILE_DAY):
-                    st.write(push_to_github(HIST_FILE_DAY, pd.read_csv(HIST_FILE_DAY)))
-                else: st.error("無本地檔")
-
-        with tab_db_full:
-            up_full = st.file_uploader("上傳全盤歷史", type=['csv'], key="up_full")
-            if up_full:
-                pd.read_csv(up_full).to_csv(HIST_FILE_FULL, index=False)
-                st.success("已更新全盤庫")
-            if st.button("寫入 GitHub (全盤)", key="git_full"):
-                if os.path.exists(HIST_FILE_FULL):
-                    st.write(push_to_github(HIST_FILE_FULL, pd.read_csv(HIST_FILE_FULL)))
-                else: st.error("無本地檔")
+        st.caption("手動維護與雲端同步")
+        tab_d, tab_f = st.tabs(["日盤", "全盤"])
+        with tab_d:
+            up_day = st.file_uploader("上傳日盤", type=['csv'], key="up_day")
+            if up_day: pd.read_csv(up_day).to_csv(HIST_FILE_DAY, index=False); st.success("更新日盤")
+            if st.button("上傳 GitHub (日)", key="gd"):
+                if os.path.exists(HIST_FILE_DAY): 
+                    with st.spinner("上傳中..."): st.write(push_to_github(HIST_FILE_DAY, pd.read_csv(HIST_FILE_DAY)))
+        with tab_f:
+            up_full = st.file_uploader("上傳全盤", type=['csv'], key="up_full")
+            if up_full: pd.read_csv(up_full).to_csv(HIST_FILE_FULL, index=False); st.success("更新全盤")
+            if st.button("上傳 GitHub (全)", key="gf"):
+                if os.path.exists(HIST_FILE_FULL): 
+                    with st.spinner("上傳中..."): st.write(push_to_github(HIST_FILE_FULL, pd.read_csv(HIST_FILE_FULL)))
 
 def process_data(mode):
-    # 1. 判斷要用的歷史檔
     hist_file = HIST_FILE_DAY if mode == 'day' else HIST_FILE_FULL
-    
-    # 2. 抓取 API 新資料 (鉅亨網)
     api_df = engine.fetch_anue_raw()
-    
-    # 3. 讀取與合併
-    # 注意: merge_and_save 裡面會負責日盤過濾 & 自動清理
     final_df = engine.merge_and_save(api_df, hist_file, is_day_mode=(mode=='day'))
-    
-    if final_df.empty:
-        return pd.DataFrame(), "無資料 (API 失敗且無歷史檔)"
-        
-    # 如果是日盤模式，但 API 沒給東西 (表示收盤了)，要特別標示
-    status = "OK"
-    if api_df.empty:
-        status = "⚠️ API 無新資料，僅顯示歷史存檔 (可能已收盤)"
-    
-    # 4. 計算指標
-    df_calc = engine.calculate_indicators(final_df, mode=mode)
-    
-    return df_calc, status
+    if final_df.empty: return pd.DataFrame(), "❌ 無資料"
+    status = "OK" if not api_df.empty else "⚠️ API 無新資料"
+    return engine.calculate_indicators(final_df, mode=mode), status
 
 if trigger_day:
-    with st.spinner("整合日盤數據中..."):
+    with st.spinner("整合日盤..."):
         df_res, status = process_data('day')
-        
-        if not df_res.empty:
-            st.session_state.df_view = df_res
-            st.session_state.current_mode = 'day'
-            st.session_state.last_update = datetime.now()
-            
-            # [Fix] 如果不是 OK，就 toast 警告一下，不要顯示綠色成功
-            if status != "OK":
-                st.toast(status, icon="⚠️")
-        else:
-            st.error(status)
+        st.session_state.df_view = df_res; st.session_state.current_mode = 'day'
+        st.session_state.last_update = datetime.now()
+        if status != "OK": st.toast(status, icon="⚠️")
 
 if trigger_full:
-    with st.spinner("整合全盤數據中..."):
+    with st.spinner("整合全盤..."):
         df_res, status = process_data('full')
-        if not df_res.empty:
-            st.session_state.df_view = df_res
-            st.session_state.current_mode = 'full'
-            st.session_state.last_update = datetime.now()
-            if status != "OK":
-                st.toast(status, icon="⚠️")
-        else:
-            st.error(status)
+        st.session_state.df_view = df_res; st.session_state.current_mode = 'full'
+        st.session_state.last_update = datetime.now()
+        if status != "OK": st.toast(status, icon="⚠️")
 
 if not st.session_state.df_view.empty and models:
-    mode_name = "🌞 日盤" if st.session_state.current_mode == 'day' else "🌙 全盤"
-    st.title(f"{mode_name}戰情室")
-    
-    # 顯示資料庫狀態
-    if st.session_state.data_range_info:
-        st.info(f"💾 資料庫範圍 (最近 5 日): {st.session_state.data_range_info}")
-    
-    st.caption(f"最後更新: {st.session_state.last_update.strftime('%H:%M:%S')}")
-    
-    if len(st.session_state.df_view) < 50:
-        st.warning(f"⚠️ 資料筆數 ({len(st.session_state.df_view)}) 不足，技術指標可能偏差。")
+    icon = "🌞" if st.session_state.current_mode == 'day' else "🌙"
+    st.title(f"{icon} 戰情室")
+    c1, c2 = st.columns([3, 1])
+    c1.info(st.session_state.data_range_info)
+    if st.session_state.last_update: c2.caption(f"更新: {st.session_state.last_update.strftime('%H:%M:%S')}")
 
     strat = StrategyEngine(models, {'entry': p_entry, 'exit': p_exit, 'stop': p_stop}, st.session_state.df_view)
     df_display, entry_idx = strat.run_analysis(u_pos, u_time)
     
+    last = df_display.iloc[-1]
+    m1, m2, m3 = st.columns(3)
+    m1.metric("價格", f"{last['Close']:.0f}")
+    m2.metric("策略", last['Strategy_Action'])
+    m3.metric("信心", last['Strategy_Detail'].split('(')[-1].replace(')', ''))
+
     df_chart = df_display.copy()
     df_chart['Time_Str'] = df_chart['Time'].dt.strftime('%H:%M')
     total_len = len(df_chart)
-    default_range_start = max(0, total_len - 150)
     
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df_chart['Time_Str'], y=df_chart['UB'], mode='lines', line=dict(width=0), showlegend=False, hoverinfo='skip'))
     fig.add_trace(go.Scatter(x=df_chart['Time_Str'], y=df_chart['LB'], mode='lines', line=dict(width=0), fill='tonexty', fillcolor='rgba(173, 216, 230, 0.2)', name='BB'))
     fig.add_trace(go.Scatter(x=df_chart['Time_Str'], y=df_chart['Close'], mode='lines', name='Price', line=dict(color='#1f77b4', width=2)))
     
-    for action, symbol, color, name in [('買進', 'triangle-up', 'red', 'Buy'), ('放空', 'triangle-down', 'green', 'Sell'), ('出', 'x', 'gray', 'Exit')]:
-        mask = df_chart['Strategy_Action'].str.contains(action)
+    for act, sym, col, nm in [('買進', 'triangle-up', 'red', 'Buy'), ('放空', 'triangle-down', 'green', 'Sell'), ('出', 'x', 'gray', 'Exit')]:
+        mask = df_chart['Strategy_Action'].str.contains(act)
         if mask.any():
-            subset = df_chart[mask]
-            fig.add_trace(go.Scatter(x=subset['Time'].dt.strftime('%H:%M'), y=subset['Close'], mode='markers', marker=dict(symbol=symbol, size=12, color=color), name=name))
+            sub = df_chart[mask]
+            fig.add_trace(go.Scatter(x=sub['Time'].dt.strftime('%H:%M'), y=sub['Close'], mode='markers', marker=dict(symbol=sym, size=12, color=col), name=nm))
 
     if entry_idx != -1 and entry_idx in df_chart.index:
-        row = df_chart.loc[entry_idx]
-        fig.add_trace(go.Scatter(x=[row['Time_Str']], y=[row['Close']], mode='markers', marker=dict(symbol='star', size=18, color='gold', line=dict(width=1, color='black')), name='My Entry'))
+        r = df_chart.loc[entry_idx]
+        fig.add_trace(go.Scatter(x=[r['Time_Str']], y=[r['Close']], mode='markers', marker=dict(symbol='star', size=18, color='gold', line=dict(width=1, color='black')), name='My Entry'))
 
-    fig.update_layout(
-        height=500, margin=dict(t=30, l=0, r=0, b=0),
-        xaxis=dict(type='category', rangeslider=dict(visible=True), range=[default_range_start, total_len-1]),
-        legend=dict(orientation="h", y=1.02, x=1, xanchor="right"),
-        hovermode="x unified"
-    )
+    fig.update_layout(height=550, margin=dict(t=30,l=10,r=10,b=10), xaxis=dict(type='category', rangeslider=dict(visible=True), range=[max(0, total_len-150), total_len-1]), legend=dict(orientation="h", y=1.02, x=0.5, xanchor="center"), hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True)
     
     st.subheader("📜 訊號履歷")
-    st.dataframe(
-        df_display.iloc[::-1],
-        height=400,
-        column_config={
-            "Time": st.column_config.DatetimeColumn("時間", format="MM-dd HH:mm", width="small"),
-            "Close": st.column_config.NumberColumn("價位", format="%d", width="small"),
-            "Strategy_Action": st.column_config.TextColumn("策略", width="small"),
-            "Strategy_Detail": st.column_config.TextColumn("多空機率", width="medium"),
-            "User_Advice": st.column_config.TextColumn("建議", width="small"),
-            "User_Note": st.column_config.TextColumn("持倉損益", width="medium"),
-            "UB": None, "LB": None
-        },
-        use_container_width=True,
-        hide_index=True
-    )
+    st.dataframe(df_display.iloc[::-1], height=400, use_container_width=True, hide_index=True)
     
-elif models is None:
-    st.warning("⚠️ 請確認 models/ 資料夾內是否有 4 個 .pkl 模型檔")
-else:
-    st.info("👈 請點擊左側「🌞 更新日盤」或「🌙 更新全盤」")
+elif models is None: st.warning("⚠️ 缺少模型檔案")
+else: st.info("👈 請點擊左側更新按鈕")
